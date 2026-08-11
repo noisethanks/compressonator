@@ -109,6 +109,7 @@ CMP_STATIC bool bc1ToggleSIMD(CGU_INT newExtension)
         useSSE42  = newExtension == EXTENSION_SSE42;
     }
 
+#ifdef CMP_CORE_X86_SIMD
     if (useAVX512 && IsAvailableAVX512(extensions))
     {
         cpu_bc1ComputeBestEndpoints = avx512_bc1ComputeBestEndpoints;
@@ -122,6 +123,7 @@ CMP_STATIC bool bc1ToggleSIMD(CGU_INT newExtension)
         cpu_bc1ComputeBestEndpoints = sse_bc1ComputeBestEndpoints;
     }
     else
+#endif
     {
         cpu_bc1ComputeBestEndpoints = _cpu_bc1ComputeBestEndpoints;
     }

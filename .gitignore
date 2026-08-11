@@ -30,6 +30,10 @@ build/Release*
 build_cli/
 build_cli_off/
 build_cli_batch/
+# tools/macos/build_flavor.sh appends the architecture, one dir per slice
+build_cli_macos_*/
+build_cli_off_macos_*/
+build_cli_batch_macos_*/
 build_extras/
 
 */shaders/compiled/*

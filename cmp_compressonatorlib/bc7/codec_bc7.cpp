@@ -69,9 +69,9 @@ unsigned int BC7ThreadProcEncode(void* param)
 {
     BC7EncodeThreadParam* tp = (BC7EncodeThreadParam*)param;
 
-    while (tp->exit == FALSE)
+    while (!tp->exit.load(std::memory_order_acquire))
     {
-        if (tp->run == TRUE)
+        if (tp->run.load(std::memory_order_acquire))
         {
 #if defined(CMP_USE_BC7ENC_RDO_BATCH)
             if (tp->batch_count > 0)
@@ -89,7 +89,9 @@ unsigned int BC7ThreadProcEncode(void* param)
             {
                 tp->encoder->CompressBlock(tp->in, tp->out);
             }
-            tp->run = FALSE;
+            // Release: everything written to *out above is visible to the
+            // producer before it can see this slot go idle.
+            tp->run.store(false, std::memory_order_release);
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(0));
@@ -216,14 +218,14 @@ CCodec_BC7::~CCodec_BC7()
 #pragma warning(disable : 4127)  //warning C4127: conditional expression is constant
                 while (1)
                 {
-                    if (m_EncodeParameterStorage[i].run != TRUE)
+                    if (!m_EncodeParameterStorage[i].run.load(std::memory_order_acquire))
                     {
                         break;
                     }
                 }
 #pragma warning(pop)
                 // Signal to the thread that it can exit
-                m_EncodeParameterStorage[i].exit = TRUE;
+                m_EncodeParameterStorage[i].exit.store(true, std::memory_order_release);
             }
 
             // Now wait for all threads to have exited
@@ -380,8 +382,8 @@ CodecError CCodec_BC7::InitializeBC7Library()
             m_EncodeParameterStorage[i].encoder = m_encoder[i];
             // Inform the thread that at the moment it doesn't have any work to do
             // but that it should wait for some and not exit
-            m_EncodeParameterStorage[i].run  = FALSE;
-            m_EncodeParameterStorage[i].exit = FALSE;
+            m_EncodeParameterStorage[i].run.store(false, std::memory_order_relaxed);
+            m_EncodeParameterStorage[i].exit.store(false, std::memory_order_relaxed);
 #if defined(CMP_USE_BC7ENC_RDO_BATCH)
             m_EncodeParameterStorage[i].batch_count = 0;
             m_EncodeParameterStorage[i].bctx        = m_bctx[i];
@@ -431,7 +433,7 @@ CodecError CCodec_BC7::EncodeBC7Block(double in[BC7_BLOCK_PIXELS][MAX_DIMENSION_
             if (m_EncodeParameterStorage == NULL)
                 return CE_Unknown;
 
-            if (m_EncodeParameterStorage[threadIndex].run == FALSE)
+            if (!m_EncodeParameterStorage[threadIndex].run.load(std::memory_order_acquire))
             {
                 found = TRUE;
                 break;
@@ -453,8 +455,9 @@ CodecError CCodec_BC7::EncodeBC7Block(double in[BC7_BLOCK_PIXELS][MAX_DIMENSION_
         // Set the output pointer for the thread to the provided location
         m_EncodeParameterStorage[threadIndex].out = out;
 
-        // Tell the thread to start working
-        m_EncodeParameterStorage[threadIndex].run = TRUE;
+        // Tell the thread to start working. Release: the input copy and the
+        // out pointer above are visible to the worker before it sees run.
+        m_EncodeParameterStorage[threadIndex].run.store(true, std::memory_order_release);
     }
     else
     {
@@ -481,7 +484,7 @@ int CCodec_BC7::AcquireIdleWorker()
     CMP_WORD threadIndex = m_LastThread;
     while (true)
     {
-        if (m_EncodeParameterStorage[threadIndex].run == FALSE)
+        if (!m_EncodeParameterStorage[threadIndex].run.load(std::memory_order_acquire))
         {
             m_LastThread = threadIndex;
             return threadIndex;
@@ -498,7 +501,9 @@ void CCodec_BC7::DispatchBatch(int slot, unsigned int count, CMP_BYTE* out)
     m_EncodeParameterStorage[slot].batch_count = count;
     if (m_Use_MultiThreading)
     {
-        m_EncodeParameterStorage[slot].run = TRUE;
+        // Release: batch_in, out and batch_count are visible to the worker
+        // before it observes run.
+        m_EncodeParameterStorage[slot].run.store(true, std::memory_order_release);
     }
     else
     {
@@ -532,7 +537,9 @@ CodecError CCodec_BC7::FinishBC7Encoding(void)
         {
             // If a thread is in the running state then we need to wait for it to finish
             // its work from the producer
-            while (m_EncodeParameterStorage[i].run == TRUE)
+            // Acquire: on return, every block these workers wrote is visible
+            // to the caller that is about to read the output buffer.
+            while (m_EncodeParameterStorage[i].run.load(std::memory_order_acquire))
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
