@@ -154,8 +154,10 @@ The flavor parameter selects the encoder and the build directory:
 
 macOS builds one slice per run and appends the architecture to the build
 directory, as in `build_cli_batch_macos_arm64`. Its second argument selects
-the slice. `universal` builds both, joins them with `lipo -create` and ad-hoc
-signs the result, which is the artifact to ship. `arm64` is the default.
+the slice, and `arm64` is the default. Every run ad-hoc signs its output with
+`--identifier compressonatorcli` and honours `OUTPUT=`, so one run already
+produces a shippable binary. `universal` builds both slices and joins them
+with `lipo -create` before signing.
 
 ### Prerequisites
 

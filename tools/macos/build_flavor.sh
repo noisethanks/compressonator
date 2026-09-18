@@ -14,10 +14,12 @@
 # (see the ISPC note below). Host detection is not used because `uname -m`
 # reports x86_64 inside a Rosetta shell. Intel users pass x86_64 explicitly.
 #
-# `universal` builds both slices, joins them with `lipo -create`, and ad-hoc
-# signs the result. That is the artifact ATAK embeds. It is opt-in because it
-# doubles the wall clock, and because it needs an ISPC that can emit both
-# architectures.
+# Every run ad-hoc signs its output with `--identifier compressonatorcli` and
+# honours OUTPUT=, so a single `arm64` or `x86_64` run already produces a
+# shippable binary. ATAK embeds one of those per architecture. `universal`
+# additionally joins the two slices with `lipo -create` and signs the join. It
+# is opt-in because it doubles the wall clock, and because it needs an ISPC
+# that can emit both architectures.
 #
 # First-time setup, from nothing:
 #
@@ -49,7 +51,7 @@
 #
 #   brew install cmake
 #
-#   compressonator/tools/macos/build_flavor.sh batch universal
+#   compressonator/tools/macos/build_flavor.sh batch
 #
 # That leaves the layout every one of these scripts expects:
 #
@@ -63,16 +65,21 @@
 #
 #   ISPC=~/dev/cmp/ispc-v1.31.0-macOS.arm64/bin/ispc \
 #   BC7ENC=~/dev/cmp/bc7enc_rdo \
-#     compressonator/tools/macos/build_flavor.sh batch universal
+#     compressonator/tools/macos/build_flavor.sh batch arm64
 #
-# OUTPUT= writes the joined binary straight to its destination, which saves
-# a copy step for a consumer such as ATAK:
+# OUTPUT= writes the signed binary straight to its destination, which saves a
+# copy step for a consumer such as ATAK. ATAK embeds one binary per
+# architecture, so its recipe is two runs:
 #
-#   OUTPUT=~/dev/atak/internal/tools/bin/compressonator-bc7e-macos \
-#     compressonator/tools/macos/build_flavor.sh batch universal
+#   B=~/dev/atak/internal/tools/bin/compressonator-bc7e-macos
+#   OUTPUT=$B-arm64 compressonator/tools/macos/build_flavor.sh batch arm64
+#   OUTPUT=$B-amd64 compressonator/tools/macos/build_flavor.sh batch x86_64
+#
+# Those file names end in amd64 because Go calls that architecture amd64. The
+# Mach-O slice inside is x86_64, which is the name this script uses.
 #
 # While iterating, build one slice. `arm64` is the default, so plain
-# `build_flavor.sh` does it, and that skips lipo and codesign entirely.
+# `build_flavor.sh` does it, and that skips the lipo join.
 #
 # Environment overrides (all optional):
 #   CMAKE=             cmake binary. Default: the first of `cmake` on PATH,
@@ -81,8 +88,9 @@
 #   ISPC=              ispc binary. Default: $ROOT/tools/ispc/macos/bin/ispc.
 #   BC7ENC=            bc7enc_rdo checkout. Default: $ROOT/bc7enc_rdo.
 #   JOBS=              build parallelism. Default: sysctl -n hw.ncpu.
-#   CODESIGN_IDENTITY= identity for `universal`. Default: `-`, ad-hoc.
-#   OUTPUT=            path `universal` writes the joined binary to.
+#   CODESIGN_IDENTITY= signing identity. Default: `-`, ad-hoc.
+#   OUTPUT=            path the signed binary is written to. Default: where
+#                      the build leaves it, under the build directory.
 #
 # Prereqs (each is checked, and each failure names its own remedy):
 #   - Xcode Command Line Tools. Probed with `xcrun --find clang++`, not
@@ -157,8 +165,8 @@ usage: ${0##*/} [off|unbatched|batch] [arm64|x86_64|universal]
           unbatched  bc7e.ispc, per-block              -> build_cli
           batch      bc7e.ispc, SIMD-batched           -> build_cli_batch  (default)
 
-  arch    arm64      one slice                                             (default)
-          x86_64     one slice
+  arch    arm64      one slice, ad-hoc signed                              (default)
+          x86_64     one slice, ad-hoc signed
           universal  both slices, joined with lipo and ad-hoc signed
 
 environment overrides:
@@ -579,6 +587,33 @@ for slice in "${SLICES[@]}"; do
 done
 
 if [[ "$ARCH" != universal ]]; then
+  # A single-arch run ends in a finished artifact, not a build-tree leftover.
+  # ATAK embeds one binary per architecture, so this is the path its recipe
+  # takes; `universal` is for consumers that want one fat file instead.
+  BIN="$SRC/${BUILD_BASE}_macos_$ARCH/bin/compressonatorcli-bin"
+  OUT="${OUTPUT:-$BIN}"
+
+  echo
+  echo "=== sign $ARCH ==="
+  if [[ "$OUT" != "$BIN" ]]; then
+    mkdir -p "$(dirname "$OUT")"   # cp does not create parent directories
+    rm -f "$OUT"                   # never let a stale copy survive a rebuild
+    cp "$BIN" "$OUT"
+  fi
+
+  # Same two reasons as the universal join below. --force, because a second
+  # `codesign --sign -` over an already-signed file exits 1, and ld ad-hoc
+  # signs the arm64 slice at link time. --identifier, because otherwise
+  # codesign derives one from the file name, which is `compressonatorcli-bin`
+  # here and whatever OUTPUT= says elsewhere.
+  codesign --force --sign "$CODESIGN_IDENTITY" --identifier "$CODESIGN_ID_NAME" "$OUT"
+  codesign --verify --strict "$OUT"
+
+  echo
+  echo "SIGNED OK: $OUT"
+  file "$OUT" | sed 's/^/  file: /'
+  codesign -dv "$OUT" 2>&1 | sed 's/^/  /'
+  shasum -a 256 "$OUT" | sed 's/^/  /'
   exit 0
 fi
 
