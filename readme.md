@@ -128,17 +128,19 @@ this binary is meant to be shipped inside another tool and shelled out to.
 
 ## 4. Building
 
-Two canonical, tested build recipes. Prefer them over assembling flags by
+Three canonical, tested build recipes. Prefer them over assembling flags by
 hand — they encode a long tail of platform-specific fixes.
 
 | Platform | Script |
 |---|---|
 | Linux | `tools/linux/build_flavor.sh [off\|unbatched\|batch]` |
 | Windows | `tools/win/build_cli_batch.ps1 -Flavor <off\|unbatched\|batch>` |
+| macOS | `tools/macos/build_flavor.sh [off\|unbatched\|batch] [arm64\|x86_64\|universal]` |
 
-Both live in this repository, and both expect to be run from a checkout
-where `compressonator/` and `bc7enc_rdo/` sit side by side — they resolve
-the outer root by walking up from their own location.
+All three live in this repository, and all three expect to be run from a
+checkout where `compressonator/` and `bc7enc_rdo/` sit side by side — they
+resolve the outer root by walking up from their own location. The macOS
+script also accepts `ISPC=` and `BC7ENC=` if your layout differs.
 
 The flavor parameter selects the encoder and the build directory:
 
@@ -150,20 +152,62 @@ The flavor parameter selects the encoder and the build directory:
 
 `batch` is the default and the recommended build.
 
+macOS builds one slice per run and appends the architecture to the build
+directory, as in `build_cli_batch_macos_arm64`. Its second argument selects
+the slice. `universal` builds both, joins them with `lipo -create` and ad-hoc
+signs the result, which is the artifact to ship. `arm64` is the default.
+
 ### Prerequisites
 
 - **bc7enc_rdo checkout** next to this repository — the build validates
   that `bc7e.ispc` is present and fails early if not.
+- **External dependencies**, via `python3 build/fetch_dependencies.py`.
+  `external/CMakeLists.txt` includes `glm` and `rapidxml` for any CLI
+  build, whatever `OPTION_CMP_OPENGL` and `OPTION_CMP_QT` are set to, so
+  this is required and not optional. On macOS the script ends in a
+  traceback on its last item, an OpenEXR tarball from a plain-HTTP host
+  that no longer answers; `OPTION_BUILD_EXR` is OFF in these recipes, so
+  that one is not needed. The macOS script checks for the two directories
+  the CLI actually resolves and names this command if they are missing.
 - **ISPC v1.31.0**, pinned. Linux expects it unpacked at
-  `tools/ispc/linux/bin/ispc`; the Windows script expects the equivalent
-  Windows package. The version is pinned deliberately — `bc7e.ispc` is
-  compiled by it.
-- A C++ toolchain. Verified on GCC (Linux) and MSVC 17.14 / Visual Studio
-  2022 Build Tools with Windows SDK 10.0.26100 (Windows).
+  `tools/ispc/linux/bin/ispc`, macOS at `tools/ispc/macos/bin/ispc`, and the
+  Windows script expects the equivalent Windows package. The version is
+  pinned deliberately — `bc7e.ispc` is compiled by it.
+- A C++ toolchain. Verified on GCC (Linux), MSVC 17.14 / Visual Studio
+  2022 Build Tools with Windows SDK 10.0.26100 (Windows), and Apple clang
+  from the Xcode Command Line Tools (macOS).
+- CMake 3.13 or later, for `-S`/`-B` and `--build --parallel`. On macOS,
+  installing CMake.app puts nothing on `PATH`; the script looks in
+  `/Applications` and in the Homebrew prefix before giving up, and `CMAKE=`
+  overrides it.
+
+**On macOS the ISPC host architecture decides whether the encoder is
+correct.** An aarch64 *host* of ispc 1.19 or later silently miscompiles `--`
+on a varying unsigned int into a no-op
+([ispc#3882](https://github.com/ispc/ispc/issues/3882)), which corrupts
+bc7e's bit packing
+([bc7enc_rdo#23](https://github.com/richgel999/bc7enc_rdo/issues/23)) for
+every target, not only arm64. This recipe disables assertions, so the
+failure is silent. Either remedy works, and the script accepts both: apply
+[bc7enc_rdo#29](https://github.com/richgel999/bc7enc_rdo/pull/29), which
+rewrites the five affected sites as `x -= 1`, or use the x86_64 ISPC
+package under Rosetta 2. The script refuses only the unsafe combination.
+
+Separately, which architectures an ISPC can emit depends on the LLVM it was
+built against, not on its own Mach-O slice, and bc7enc_rdo#29 does not change
+that. The official macOS packages carry both backends, so
+`ispc-v1.31.0-macOS.arm64` cross-compiles the x86_64 slice. Homebrew's `ispc`
+links `llvm@22` and rejects `--arch=x86-64` outright. The script compiles a
+throwaway kernel for each requested slice before starting any build, so a
+mismatch fails in the first second rather than minutes into `make`.
 
 On Windows, `build_cli_batch.ps1` deliberately does **not** bootstrap the
-Visual Studio environment; `tools/win/build_flavor.bat` wraps it with
-`VsDevCmd.bat` if you want a one-shot invocation.
+Visual Studio environment. Run it from a Developer PowerShell, or wrap it with
+`VsDevCmd.bat` yourself.
+
+For the same reason, the macOS script stops at a printed path and does not
+fetch ISPC, clone bc7enc_rdo, apply bc7enc_rdo#29, or install Rosetta 2. It
+detects each and prints the exact command.
 
 ## 5. Results
 
@@ -236,9 +280,9 @@ fork's changes. They affect upstream regardless of this work.
 |---|---|
 | **Linux** | Built, verified, fully static (0 dynamic dependencies). |
 | **Windows** | Built, verified, statically linked (3 OS-shipped DLLs). |
-| **macOS** | **Out of scope.** Not built, not tested. Contributions welcome. |
+| **macOS** | Built, verified. Universal (x86_64 + arm64), ad-hoc signed, 3 OS-shipped dylibs. |
 
-Cross-platform correctness is backed by byte-identical output, not by
+**Linux and Windows correctness is backed by byte-identical output**, not by
 assertion. Every verification MD5 produced by the Windows/MSVC build
 matches the Linux/GCC reference exactly:
 
@@ -251,6 +295,22 @@ matches the Linux/GCC reference exactly:
 The same three harnesses were re-run after every relink and code-removal
 pass in this project — the static-linking change and the ETC removal
 both had to prove they were byte-level no-ops before being accepted.
+
+**macOS does not join that byte-identity claim, and cannot.** The arm64
+slice encodes through bc7e's NEON target and the scalar BC1/BC3/BC4/BC5
+kernels built for arm64, both of which differ in the low bits from the
+SSE/AVX build. Measured on a mixed corpus, 18 of 38 format/mip
+configurations differ byte-wise between the two macOS slices, while PSNR
+tracks to within ±0.1 dB. Output stays reproducible *within* a slice: the
+same input gives the same bytes on every run. Treat the MD5 harnesses above
+as a Linux/Windows contract and macOS as quality-equivalent, not
+bit-equivalent.
+
+macOS also carries one fix the other two platforms never needed to expose: a
+data race in the BC7 worker handoff, which `volatile` does not order. x86-64
+store ordering hides it completely. On arm64 it produced 10 distinct outputs
+from 10 identical runs of the **stock** codec, so it is an upstream defect
+that the macOS port merely made visible.
 
 ---
 
