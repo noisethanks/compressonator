@@ -34,8 +34,17 @@ void GetCPUID(int outInfo[4], int functionID)
 #ifdef _WIN32
     __cpuidex(outInfo, functionID, 0);  // defined in intrin.h
 #else
-    // To Do
-    //__cpuid_count(0, function_id, outInfo[0], outInfo[1], outInfo[2], outInfo[3]);
+    // No cpuid implementation outside Windows. The Linux path skips
+    // detection entirely (see the __linux__ guard in GetCPUExtensions), so
+    // report an empty result here instead of leaving the caller's buffer
+    // uninitialized: macOS does enter that code, and reading uninitialized
+    // stack could dispatch BC1 onto an SSE/AVX/AVX-512 kernel the CPU may
+    // not implement. Zeros keep every non-Windows host on the same scalar
+    // path, which is what the Linux reference build encodes with.
+    outInfo[0] = 0;
+    outInfo[1] = 0;
+    outInfo[2] = 0;
+    outInfo[3] = 0;
 #endif
 }
 
@@ -61,7 +70,7 @@ CPUExtensions GetCPUExtensions()
 {
     CPUExtensions result = {};
 
-    int cpuInfo[4];
+    int cpuInfo[4] = {0, 0, 0, 0};
 
 #ifndef __linux__
 

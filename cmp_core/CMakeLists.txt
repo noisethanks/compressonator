@@ -66,45 +66,66 @@ set_target_properties(CMP_Core PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
 
 # Core SIMD options
 
-# SSE
-add_library(CMP_Core_SSE STATIC)
-target_sources(CMP_Core_SSE PRIVATE source/core_simd_sse.cpp)
-target_include_directories(CMP_Core_SSE PRIVATE source shaders)
-
-if (UNIX)
-    target_compile_options(CMP_Core_SSE PRIVATE -march=nehalem)
+# These three libraries are x86 intrinsic code compiled at three instruction
+# set levels, and -march=nehalem / haswell / skylake-avx512 are x86 flags.
+# Skip them on any other target: core_simd.h gates the declarations and
+# bc1_cmp.h gates the dispatch, so the scalar kernels stand alone there.
+# On Apple platforms CMAKE_OSX_ARCHITECTURES names the slice being built
+# while CMAKE_SYSTEM_PROCESSOR still reports the host, so it has to win —
+# an arm64 host cross-building the x86_64 slice needs these libraries.
+set(CMP_TARGET_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
+if (CMAKE_OSX_ARCHITECTURES)
+    set(CMP_TARGET_ARCH "${CMAKE_OSX_ARCHITECTURES}")
 endif()
 
-set_target_properties(CMP_Core_SSE PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
-
-# AVX
-add_library(CMP_Core_AVX STATIC)
-target_sources(CMP_Core_AVX PRIVATE source/core_simd_avx.cpp)
-target_include_directories(CMP_Core_AVX PRIVATE source shaders)
-
-if (WIN32)
-    target_compile_options(CMP_Core_AVX PRIVATE /arch:AVX2)
+if (CMP_TARGET_ARCH MATCHES "^(x86_64|amd64|AMD64|x86|i[3-6]86)$")
+    set(CMP_TARGET_X86 ON)
 else()
-    target_compile_options(CMP_Core_AVX PRIVATE -march=haswell)
+    set(CMP_TARGET_X86 OFF)
+    message(STATUS "CMP_Core: target arch '${CMP_TARGET_ARCH}' is not x86 — building scalar BC1 kernels only")
 endif()
 
-set_target_properties(CMP_Core_AVX PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
+if (CMP_TARGET_X86)
+    # SSE
+    add_library(CMP_Core_SSE STATIC)
+    target_sources(CMP_Core_SSE PRIVATE source/core_simd_sse.cpp)
+    target_include_directories(CMP_Core_SSE PRIVATE source shaders)
 
-# AVX-512
-add_library(CMP_Core_AVX512 STATIC)
-target_sources(CMP_Core_AVX512 PRIVATE source/core_simd_avx512.cpp)
-target_include_directories(CMP_Core_AVX512 PRIVATE source shaders)
+    if (UNIX)
+        target_compile_options(CMP_Core_SSE PRIVATE -march=nehalem)
+    endif()
 
-if (WIN32)
-    target_compile_options(CMP_Core_AVX512 PRIVATE /arch:AVX512)
-else()
-    target_compile_options(CMP_Core_AVX512 PRIVATE -march=skylake-avx512)
+    set_target_properties(CMP_Core_SSE PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
+
+    # AVX
+    add_library(CMP_Core_AVX STATIC)
+    target_sources(CMP_Core_AVX PRIVATE source/core_simd_avx.cpp)
+    target_include_directories(CMP_Core_AVX PRIVATE source shaders)
+
+    if (WIN32)
+        target_compile_options(CMP_Core_AVX PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(CMP_Core_AVX PRIVATE -march=haswell)
+    endif()
+
+    set_target_properties(CMP_Core_AVX PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
+
+    # AVX-512
+    add_library(CMP_Core_AVX512 STATIC)
+    target_sources(CMP_Core_AVX512 PRIVATE source/core_simd_avx512.cpp)
+    target_include_directories(CMP_Core_AVX512 PRIVATE source shaders)
+
+    if (WIN32)
+        target_compile_options(CMP_Core_AVX512 PRIVATE /arch:AVX512)
+    else()
+        target_compile_options(CMP_Core_AVX512 PRIVATE -march=skylake-avx512)
+    endif()
+
+    set_target_properties(CMP_Core_AVX512 PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
+
+    # Link SIMD libraries to CMP_Core
+    target_link_libraries(CMP_Core PRIVATE CMP_Core_SSE CMP_Core_AVX CMP_Core_AVX512)
 endif()
-
-set_target_properties(CMP_Core_AVX512 PROPERTIES FOLDER ${PROJECT_FOLDER_SDK_LIBS})
-
-# Link SIMD libraries to CMP_Core
-target_link_libraries(CMP_Core PRIVATE CMP_Core_SSE CMP_Core_AVX CMP_Core_AVX512)
 
 # ------------------------------------------------------------------------
 # Optional: route the CPU BC7 encoder through richgel999/bc7enc_rdo's
@@ -119,6 +140,16 @@ if (OPTION_CMP_USE_BC7ENC_RDO)
     set(BC7ENC_RDO_ISPC "${CMAKE_SOURCE_DIR}/../tools/ispc/linux/bin/ispc" CACHE FILEPATH
         "Path to the ispc compiler binary")
 
+    # ISPC code-generation target selection. The defaults reproduce the
+    # verified Linux/Windows x86-64 build exactly. macOS needs them
+    # configurable for two reasons: an arm64 host defaults ispc to aarch64
+    # (so an x86-64 slice must ask for --arch=x86-64), and an arm64 slice
+    # needs the NEON target instead of the four SSE/AVX ones.
+    set(BC7ENC_RDO_ISPC_ARCH "" CACHE STRING
+        "ispc --arch value; empty uses the ispc host default")
+    set(BC7ENC_RDO_ISPC_TARGETS "sse2,sse4,avx,avx2" CACHE STRING
+        "ispc --target list (comma-separated)")
+
     if (NOT EXISTS "${BC7ENC_RDO_DIR}/bc7e.ispc")
         message(FATAL_ERROR "OPTION_CMP_USE_BC7ENC_RDO=ON but ${BC7ENC_RDO_DIR}/bc7e.ispc not found. Set BC7ENC_RDO_DIR to the bc7enc_rdo checkout.")
     endif()
@@ -129,14 +160,25 @@ if (OPTION_CMP_USE_BC7ENC_RDO)
     set(BC7E_OBJ_DIR "${CMAKE_CURRENT_BINARY_DIR}/bc7e_ispc")
     file(MAKE_DIRECTORY "${BC7E_OBJ_DIR}")
 
-    set(BC7E_OBJS
-        "${BC7E_OBJ_DIR}/bc7e.o"
-        "${BC7E_OBJ_DIR}/bc7e_sse2.o"
-        "${BC7E_OBJ_DIR}/bc7e_sse4.o"
-        "${BC7E_OBJ_DIR}/bc7e_avx.o"
-        "${BC7E_OBJ_DIR}/bc7e_avx2.o"
-    )
+    # ispc emits one object per target plus a dispatch object, but only when
+    # more than one target is requested. A single-target build (e.g. NEON)
+    # emits bc7e.o alone, so listing per-target objects there would declare
+    # outputs the compiler never writes.
+    string(REPLACE "," ";" BC7E_TARGET_LIST "${BC7ENC_RDO_ISPC_TARGETS}")
+    set(BC7E_OBJS "${BC7E_OBJ_DIR}/bc7e.o")
+    list(LENGTH BC7E_TARGET_LIST BC7E_TARGET_COUNT)
+    if (BC7E_TARGET_COUNT GREATER 1)
+        foreach(BC7E_TARGET IN LISTS BC7E_TARGET_LIST)
+            string(REPLACE "-" "_" BC7E_TARGET_SUFFIX "${BC7E_TARGET}")
+            list(APPEND BC7E_OBJS "${BC7E_OBJ_DIR}/bc7e_${BC7E_TARGET_SUFFIX}.o")
+        endforeach()
+    endif()
     set(BC7E_HEADER "${BC7E_OBJ_DIR}/bc7e_ispc.h")
+
+    set(BC7E_ISPC_ARCH_ARG "")
+    if (BC7ENC_RDO_ISPC_ARCH)
+        set(BC7E_ISPC_ARCH_ARG "--arch=${BC7ENC_RDO_ISPC_ARCH}")
+    endif()
 
     add_custom_command(
         OUTPUT ${BC7E_OBJS} ${BC7E_HEADER}
@@ -144,10 +186,11 @@ if (OPTION_CMP_USE_BC7ENC_RDO)
                 "${BC7ENC_RDO_DIR}/bc7e.ispc"
                 -o "${BC7E_OBJ_DIR}/bc7e.o"
                 -h "${BC7E_HEADER}"
-                --target=sse2,sse4,avx,avx2
+                ${BC7E_ISPC_ARCH_ARG}
+                --target=${BC7ENC_RDO_ISPC_TARGETS}
                 --opt=fast-math --opt=disable-assertions
         DEPENDS "${BC7ENC_RDO_DIR}/bc7e.ispc"
-        COMMENT "Generating bc7e.ispc objects for CMP_Core"
+        COMMENT "Generating bc7e.ispc objects for CMP_Core (${BC7ENC_RDO_ISPC_TARGETS})"
         VERBATIM
     )
 

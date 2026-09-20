@@ -24,10 +24,21 @@
 #ifndef CORE_SIMD_H_
 #define CORE_SIMD_H_
 
+// The SSE/AVX/AVX-512 kernels below are written against x86 intrinsics, and
+// CMP_Core_SSE / CMP_Core_AVX / CMP_Core_AVX512 are only built for x86
+// targets. Everywhere else the scalar kernels are the whole implementation,
+// so the declarations and their call sites are gated on this macro rather
+// than left to fail at link time.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#define CMP_CORE_X86_SIMD 1
+#endif
+
 // BC1
 
+#ifdef CMP_CORE_X86_SIMD
 float sse_bc1ComputeBestEndpoints(float*, float*, float*, float*, float*, int, int);
 float avx_bc1ComputeBestEndpoints(float*, float*, float*, float*, float*, int, int);
 float avx512_bc1ComputeBestEndpoints(float*, float*, float*, float*, float*, int, int);
+#endif
 
 #endif

@@ -72,9 +72,17 @@ set(PROJECT_FOLDER_APPS_PLUGIN_STATIC "${PROJECT_FOLDER_APPS}/Plugins/Static")
 
 #----------------------------------------
 # Check compiler feature support levels
-# For Apple (Mac) default to C++11
+#
+# Apple used to be excluded here and left at C++11. That silently disabled
+# the std::filesystem paths in cmp_fileio.cpp, where CMP_GetJustFileExt
+# falls back to substr(find_last_of('.') + 1) and returns "dds" instead of
+# ".dds". IsDestinationUnCompressed() compares against ".dds", so every
+# destination looked uncompressed and the CLI decompressed each encode
+# before writing it — a .dds full of plain BGRA pixels, whatever -fd asked
+# for. Apple clang implements C++17 and std::filesystem, so probe it like
+# any other host.
 #---------------------------------------
-if (CMP_HOST_LINUX OR CMP_HOST_WINDOWS)
+if (CMP_HOST_LINUX OR CMP_HOST_WINDOWS OR CMP_HOST_APPLE)
     if("cxx_std_11" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
         set(COMPILER_SUPPORTS_CXX11 ON)
         message("Compiler Supports cxx_std_11")
@@ -267,7 +275,10 @@ add_compile_definitions($<$<CONFIG:Debug>:_DEBUG>)
 # -----------------------------------
 # Set or get all package requirements
 # -----------------------------------
-if (COMPILER_SUPPORTS_CXX17 AND CMP_HOST_WINDOWS)
+# Apple joins the C++17 branch rather than the C++14 one below: libc++ ships
+# std::filesystem, and its <experimental/filesystem> — what the C++14 branch
+# includes — was removed years ago.
+if (COMPILER_SUPPORTS_CXX17 AND (CMP_HOST_WINDOWS OR CMP_HOST_APPLE))
     set(CMAKE_CXX_STANDARD 17)
     add_compile_definitions(_CMP_CPP17_=1)
 else()
@@ -299,11 +310,13 @@ else()
     endif()
 
     # filesystem support for c++14 
-    if (COMPILER_SUPPORTS_CXX14)
+    # Skipped on Apple: the standard is already 17 there, and stdc++fs is a
+    # libstdc++ library that does not exist under libc++.
+    if (COMPILER_SUPPORTS_CXX14 AND NOT CMP_HOST_APPLE)
         set(CMAKE_CXX_STANDARD 14)
         #add_definitions(-std=c++14)
         link_libraries(stdc++fs)
-    else()
+    elseif (NOT CMP_HOST_APPLE)
         if (CMP_HOST_LINUX)
             set(CMAKE_CXX_STANDARD 11)
         endif()

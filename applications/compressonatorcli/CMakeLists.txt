@@ -164,12 +164,23 @@ if (UNIX)
             ${OpenEXR_LIBRARIES}
         )
     else()
-        list(APPEND CMP_LIBS "/usr/lib/libz.dylib")
-        list(APPEND CMP_LIBS "/usr/local/lib/libHalf.dylib")
-        list(APPEND CMP_LIBS "/usr/local/lib/libImath.dylib")
-        list(APPEND CMP_LIBS "/usr/local/lib/libIlmThread.dylib")
-        list(APPEND CMP_LIBS "/usr/local/lib/libIex.dylib")
-        list(APPEND CMP_LIBS "/usr/local/lib/libIlmImf.dylib")
+        # macOS. Link the OS zlib by name: the old absolute path
+        # /usr/lib/libz.dylib has no file behind it on Big Sur and later,
+        # where system libraries live only in the dyld shared cache. The
+        # linker resolves -lz through the SDK stub. The OpenEXR entries
+        # assumed a /usr/local Homebrew install of OpenEXR 2.2, so they
+        # only apply when EXR support is actually built.
+        list(APPEND CMP_LIBS
+            Threads::Threads
+            z
+        )
+        if (OPTION_BUILD_EXR)
+            list(APPEND CMP_LIBS "/usr/local/lib/libHalf.dylib")
+            list(APPEND CMP_LIBS "/usr/local/lib/libImath.dylib")
+            list(APPEND CMP_LIBS "/usr/local/lib/libIlmThread.dylib")
+            list(APPEND CMP_LIBS "/usr/local/lib/libIex.dylib")
+            list(APPEND CMP_LIBS "/usr/local/lib/libIlmImf.dylib")
+        endif()
     endif()
 else()
         if (OPTION_CMP_QT)

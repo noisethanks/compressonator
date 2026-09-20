@@ -76,13 +76,19 @@ if (CMP_HOST_WINDOWS)
 
 else()
 
-    find_package(OpenCV) 
-    if (OpenCV_FOUND)
-        target_include_directories(Image_Analysis
-                                   PRIVATE
-                                   ${OpenCV_INCLUDE_DIRS})
-    else()
-        message(FATAL_ERROR "Package OpenCV are required, but not found. In Unix, run initsetup_unix.sh or sudo apt-get install libopencv-dev to install the libs.")
+    # OpenCV is only reachable from ssim.cpp, which OPTION_CMP_OPENCV=OFF
+    # already excludes from ANALYSIS_SSIM_FILES above. Requiring the package
+    # unconditionally makes a CLI build fail to configure on any host without
+    # OpenCV installed, even though nothing in that build would link it.
+    if (OPTION_CMP_OPENCV)
+        find_package(OpenCV)
+        if (OpenCV_FOUND)
+            target_include_directories(Image_Analysis
+                                       PRIVATE
+                                       ${OpenCV_INCLUDE_DIRS})
+        else()
+            message(FATAL_ERROR "Package OpenCV are required, but not found. In Unix, run initsetup_unix.sh or sudo apt-get install libopencv-dev to install the libs.")
+        endif()
     endif()
     
     set_property(TARGET Image_Analysis PROPERTY POSITION_INDEPENDENT_CODE TRUE)

@@ -28,6 +28,7 @@
 #ifndef _CODEC_BC7_H_INCLUDED_
 #define _CODEC_BC7_H_INCLUDED_
 
+#include <atomic>
 #include <thread>
 
 #include "bc7_encode.h"
@@ -55,8 +56,17 @@ struct BC7EncodeThreadParam
     BC7BlockEncoder*  encoder;
     double            in[MAX_SUBSET_SIZE][MAX_DIMENSION_BIG];
     CMP_BYTE*         out;
-    volatile CMP_BOOL run;
-    volatile CMP_BOOL exit;
+    // Handoff flags between the producer and this worker. They must be
+    // atomic, not volatile: volatile orders nothing between threads, so on a
+    // weakly ordered CPU (arm64) the producer can observe run == false before
+    // the worker's writes to *out are visible, then reuse the slot and
+    // overwrite in/batch_in while the worker is still reading it. That races
+    // per block and corrupts output — measured as 10 different results from
+    // 10 identical runs on Apple Silicon. x86-64's store ordering hides the
+    // bug, which is why it went unnoticed. Release on store, acquire on load,
+    // pairs the slot handoff in both directions.
+    std::atomic<bool> run;
+    std::atomic<bool> exit;
 #if defined(CMP_USE_BC7ENC_RDO_BATCH)
     // Batched-mode fields. When batch_count > 0, worker dispatches to
     // bc7e batch entry point using batch_in/batch_count/bctx and writes
