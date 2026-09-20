@@ -4257,3 +4257,675 @@ with the actual titles and URLs (Richard Geldreich, April 2018):
 The README's §1 cites the same two directly, so the sourcing caveat it
 previously carried (titles from `CLAUDE.md`, not `NOTES.md`) is removed —
 `NOTES.md` now carries them itself.
+
+## Phase 8 — `-EncodeWith` / GPU / HPC path investigation
+
+Motivated by ATAK's plan to always pass `-EncodeWith CPU` explicitly rather
+than rely on default behavior. Goal: confirm that plan is actually
+sufficient, and understand what the other `-EncodeWith` values do on a
+binary with no GPU codec paths compiled in.
+
+### Build-level check — no OpenCL toggle exists
+
+Grep of every `CMakeLists.txt` in `compressonator/`: no
+`OPTION_CMP_OPENCL`, `CMP_GPU_OCL`, or `OPTION_BUILD_OPENCL` option
+anywhere. `CMP_Compute_type::CMP_GPU_OCL` exists as a runtime enum value
+(`= 3`), but nothing in the build system gates it — there's no flag to
+flip, unlike `OPTION_CMP_DIRECTX`/`OPTION_CMP_OPENGL`/`OPTION_CMP_OPENCV`,
+which are already disabled in both `build_flavor.sh` and
+`build_cli_batch.ps1`.
+
+`nm`/`strings` on the built binary: only the `--help` text mentions
+OpenCL/DirectX ("Example compression using GPU Hardware or shader code
+with frameworks like OpenCL or DirectX:"). No `clCreateContext`,
+`clBuildProgram`, `clGetPlatformIDs`, no `OpenCL.dll`/`libOpenCL` string
+constant — confirms no dlopen target is compiled in either. **Zero GPU
+codec paths exist in this binary, full stop**, consistent with
+`OPTION_CMP_DIRECTX=OFF`/`OPTION_CMP_OPENGL=OFF` already established in
+Phase 1.
+
+### Behavior — `CPU` explicit vs. omitted
+
+Tested on `ruby.png` (576×416), `-Quality 0.50 -NumThreads 8`, across
+both platforms with 3× repeats:
+
+| Platform | `-EncodeWith CPU` MD5 | omitted MD5 | Match? |
+|---|---|---|---|
+| Windows (native) | `10cda379ba6f01c0c20179723b319d33` | same | ✅ |
+| Linux (native) | `10cda379ba6f01c0c20179723b319d33` | same | ✅ |
+
+Both match each other and match the Phase 3 part 4c reference MD5 for
+Q=0.50 (`basic` bucket). **Cross-platform bit-identical on production
+flags — the omitted-flag default is `CPU`, confirmed at the source
+(`cmdline.cpp`, omitted flag falls into the `CMP_CPU` branch) and
+empirically on both platforms.**
+
+An earlier pass (Wine-mediated, against the Windows `.exe`, small 64×64
+test image) showed the same CPU/omitted equivalence
+(`be44c1534a7c34b5d9c4286251c8db11` both runs) — consistent with the
+above, just not directly comparable since it used a different image and
+ran through Wine rather than natively.
+
+### Behavior — `GPU` / `OCL`
+
+Both explicit `-EncodeWith GPU` and `-EncodeWith OCL`: exit 0, no hang,
+no crash, <1s, output MD5 identical to the `CPU`-explicit run on both
+platforms. A warning is printed before proceeding:
+"Warning! CPU will be used for compression"
+
+**Stream — corrected.** An earlier check on Linux (native, small test
+image, no explicit redirection) reported this on **stderr**. A follow-up
+check redirecting each stream independently (`2>/dev/null` — warning
+still visible; `1>/dev/null` — warning gone) confirms the warning is
+actually on **stdout**. The earlier "stderr" claim was wrong; this
+supersedes it. The Windows-native pass also reported stdout, consistent
+with this correction, though it wasn't independently confirmed via
+redirection the same way.
+
+**Practical implication for ATAK:** since GPU/OCL cleanly fall back to
+CPU with byte-identical output, `-EncodeWith CPU` is technically
+redundant defensively — but it's the only way to suppress the fallback
+warning from appearing on stdout. If ATAK ever parses or logs the CLI's
+stdout for anything, passing `CPU` explicitly avoids that pollution.
+Worth keeping the explicit flag for this reason even though the
+fallback itself is safe.
+
+### Behavior — `HPC` (integration gap, documented, not fixed)
+
+`-EncodeWith HPC` does **not** reach the bc7e adapter. Tested against
+both `build_cli_batch` (bc7e) and `build_cli_off` (stock):
+
+| Build | `-EncodeWith HPC` MD5 | Time |
+|---|---|---|
+| `build_cli_batch` (bc7e) | `2ab1304a5a012a040269263616132c64` | 311ms |
+| `build_cli_off` (stock) | `2Gab1304a5a012a040269263616132c64` | 311ms |
+| `build_cli_off`, `-EncodeWith CPU` (stock) | `83b3429a4db9ea321f5a5609ae1ffe63` | 3787ms |
+| `build_cli_batch`, `-EncodeWith CPU` (bc7e) | `10cda379ba6f...` | 275ms |
+
+HPC output is identical between the bc7e-enabled and stock builds —
+the bc7e hook is not on this path. It's also not stock's regular CPU
+codec (different MD5, different mode mix) — it's a third, distinct
+path, likely the `CMP_Core` SDK's own HPC/SPMD kernel. Native Linux and
+Wine-mediated Windows runs of `-EncodeWith HPC` produced byte-identical
+output to each other (`c42d72efeb055d53d824f4673c8c820e`), confirming
+this is consistent, deterministic behavior, not a fluke.
+
+Mode histograms confirm three genuinely distinct encoders are in play:
+
+m0    m1    m2   m3     m4     m5     m6
+bc7e (CPU/GPU/OCL) 154 1741 0 686 0 11353 1042
+HPC (both builds) 46 1663 54 439 12030 81 663
+stock CPU 107 1819 65 12537 0 0 448
+
+Output is valid, not garbage — RGB PSNR vs. source: bc7e 49.86 dB, HPC
+50.06 dB, stock CPU 50.20 dB. All three are legitimate, working
+encoders; HPC just isn't the one this fork modified.
+
+**Decision: documented limitation, not a blocker.** ATAK always passes
+explicit `-EncodeWith CPU` and never invokes HPC — this gap doesn't
+affect the actual integration. Wiring bc7e into the HPC path would be
+real, non-trivial work (a third integration point, understanding the
+SDK's SPMD kernel) spent on a path nobody in this project's use case
+reaches. Worth revisiting only if a future consumer of this fork
+specifically wants an HPC-backed bc7e path.
+
+### Verdict
+
+- `-EncodeWith CPU` / omitted: bit-identical, cross-platform, confirmed
+  on production flags and a real texture. ATAK's plan to always pass it
+  explicitly is correct — not because the default is unsafe, but
+  because it's the only way to suppress the GPU-fallback stdout warning.
+- `-EncodeWith GPU` / `OCL`: safe, deterministic fallback to CPU with a
+  printed (stdout) warning. No crash/hang/garbage risk even if passed
+  by accident.
+- `-EncodeWith HPC`: real integration gap — reaches neither bc7e nor
+  stock's regular CPU codec, uses a separate SDK path entirely.
+  Harmless for ATAK's actual usage (never invoked), documented here so
+  it isn't mistaken for a faster bc7e variant by a future reader.
+
+## Investigation 2 — BC1/BCn codec survey + BC1 quality gap
+
+### Q1. Threading model — BC1/BC3/BC4/BC5 codecs
+
+From the previous session's investigator run (confirmed against source):
+
+| Codec | Class | File | Threading | volatile-CMP_BOOL? |
+|-------|-------|------|-----------|-------------------|
+| BC1 | `BC1_EncodeClass` | `applications/_plugins/ccmp_sdk/bc1/bc1.h:65` | Single-threaded | No |
+| BC3 | `BC3_EncodeClass` | `applications/_plugins/ccmp_sdk/bc3/bc3.h:65` | Single-threaded | No |
+| BC4 | `BC4_EncodeClass` | `applications/_plugins/ccmp_sdk/bc4/bc4.h:65` | Single-threaded | No |
+| BC5 | `BC5_EncodeClass` | `applications/_plugins/ccmp_sdk/bc5/bc5.h:65` | Single-threaded | No |
+| BC7 | `CCodec_BC7` | `cmp_compressonatorlib/bc7/codec_bc7.h:73` | Worker pool | **Yes** |
+
+BC1–BC5 are plugin-style codecs inheriting from `CMP_Encoder`
+(`plugininterface.h:64`), which has no threading. Each calls a scalar
+per-block compress function directly. The volatile-CMP_BOOL race
+(Jorge's fix) exists only in BC7's worker pool — no analogous pattern
+in BC1–BC5.
+
+### Q2. Version and SIMD coverage
+
+**Version: 4.5** (`compressonator/CMakeLists.txt:24-28`, git tag
+`Compressonator v4.5 Update`).
+
+**v4.2 RefineSteps — PRESENT.**
+`cmp_compressonatorlib/dxtc/codec_dxtc.cpp:106-114` — SetParameter
+parsing (0–2 range guard). `cmp_compressonatorlib/ati/compressonatorxcodec.cpp:1784`
+— `Refine1()` iterative loop (9×9 mode search, runs until no
+improvement).
+
+**v4.4 SSE4/AVX2/AVX512 BC1 paths — PRESENT.**
+Three separate static libs with architecture-gated compile flags:
+
+| Lib | File | Flag |
+|-----|------|------|
+| `CMP_Core_SSE` | `cmp_core/source/core_simd_sse.cpp:36` | `-march=nehalem` |
+| `CMP_Core_AVX` | `cmp_core/source/core_simd_avx.cpp:55` | `-march=haswell` |
+| `CMP_Core_AVX512` | `cmp_core/source/core_simd_avx512.cpp:55` | `-march=skylake-avx512` |
+
+All three implement `{sse,avx,avx512}_bc1ComputeBestEndpoints()`. CMake
+wiring at `cmp_core/CMakeLists.txt:69-107`. **BC1 is already
+SIMD-optimized — it is not in the pre-2021 stagnant state BC7 was in.**
+
+**BC3/BC4/BC5 SIMD — ABSENT.** Plugins call scalar `CompBlock1X()`
+(`cmp_compressonatorlib/dxtc/codec_dxtc_alpha.cpp:45-46`) or the GPU
+shader path (`CompressBlockBC3/4/5_Internal()`). `cmp_core/source/core_simd.h:29-31`
+lists BC1-only SIMD functions. No SSE/AVX paths exist for BC3/BC4/BC5.
+
+### Q3. BC1 quality benchmark — stock Compressonator vs rgbcx vs texconv
+
+**Methodology.** Same 9-file GAMMA corpus. Source decoded from corpus
+DDS → TGA via held-constant decoder (`build_cli_off -fd RGBA_8888`).
+TGA → PNG conversion via PIL for bc7enc input. PSNR: RGB@α>0 mask
+(source pixels with alpha > 0), consistent with Phase 3 methodology.
+Best-of-3 wall clock. All variants best-of-3 interleaved.
+
+**Variants:**
+- `cmp_BC1_Q1.0` — `build_cli_off`, `-fd BC1 -Quality 1.0 -NumThreads 8`
+- `bc7enc_rgbcx` — `bc7enc_rdo/build/bc7enc -1 -L18` (BC1, rgbcx L18 max-quality, single-process)
+- `texconv_BC1` — `texconv -f BC1_UNORM -m 1` (no mipmaps)
+
+**Raw table (t = best-of-3 CLI wall time):**
+
+```
+file                              WxH        variant          t(s)   RGB@a>0 dB
+ui_icon_maidfillcant         32x16     cmp_BC1_Q1.0       0.001     28.69
+                                       bc7enc_rgbcx       0.030     40.50
+                                       texconv_BC1        0.002     26.92
+
+ui_icon_pm_drum             128x64     cmp_BC1_Q1.0       0.001     35.91
+                                       bc7enc_rgbcx       0.029     36.70
+                                       texconv_BC1        0.002     32.37
+
+ui_icon_sks_short           256x64     cmp_BC1_Q1.0       0.001     32.87
+                                       bc7enc_rgbcx       0.031     33.71
+                                       texconv_BC1        0.002     30.98
+
+ui_icon_maidindicators      256x128    cmp_BC1_Q1.0       0.001     33.46
+                                       bc7enc_rgbcx       0.031     40.48
+                                       texconv_BC1        0.003     32.91
+
+ui_icon_rspartan            512x64     cmp_BC1_Q1.0       0.002     34.89
+                                       bc7enc_rgbcx       0.031     35.70
+                                       texconv_BC1        0.002     29.81
+
+ui_icon_mg36e               512x128    cmp_BC1_Q1.0       0.002     37.50
+                                       bc7enc_rgbcx       0.034     38.64
+                                       texconv_BC1        0.002     33.78
+
+ui_icon_w50                 512x256    cmp_BC1_Q1.0       0.004     32.83
+                                       bc7enc_rgbcx       0.038     33.97
+                                       texconv_BC1        0.003     30.40
+
+ui_maid_pistols            2048x256    cmp_BC1_Q1.0       0.017     35.03
+                                       bc7enc_rgbcx       0.091     35.94
+                                       texconv_BC1        0.005     31.49
+
+dovetail_bump              2048x2048   cmp_BC1_Q1.0       0.166     36.80
+                                       bc7enc_rgbcx       0.976     37.01
+                                       texconv_BC1        0.027      6.27 ← invalid (see below)
+```
+
+**Texconv dovetail result — methodology invalid.** Dovetail source TGA
+has partial alpha (mean ~127, range 0–255 — STALKER bump maps store
+data in the alpha channel, not a transparency value). texconv converts
+from straight-alpha to premultiplied alpha before encoding: decoded RGB
+channels are ≈ source_RGB × (alpha/255). Since we compare against
+non-premultiplied source, the PSNR collapses. Confirmed by per-channel
+mean: tex_B_mean=56 ≈ src_B_mean(126) × 0.44 ≈ mean_alpha(127)/255.
+Dovetail excluded from the delta summary below.
+
+**Delta vs cmp_BC1_Q1.0 — 8 icon files (α ∈ {0, 255} only, fair comparison):**
+
+```
+file                       cmp(dB)  bc7enc d(dB)  texconv d(dB)
+ui_icon_maidfillcant        28.69    +11.81         -1.77
+ui_icon_pm_drum             35.91    +0.79          -3.54
+ui_icon_sks_short           32.87    +0.84          -1.89
+ui_icon_maidindicators      33.46    +7.02          -0.55
+ui_icon_rspartan            34.89    +0.81          -5.08
+ui_icon_mg36e               37.50    +1.14          -3.72
+ui_icon_w50                 32.83    +1.14          -2.44
+ui_maid_pistols             35.03    +0.92          -3.54
+```
+
+rgbcx beats Compressonator on every file. Texconv loses to Compressonator
+on every file.
+
+**Wall-clock totals (9 files, CLI):**
+
+| variant | sum 9 files | mean/file |
+|---------|-------------|-----------|
+| cmp_BC1_Q1.0 | 0.195s | 0.022s |
+| bc7enc_rgbcx | 1.291s | 0.143s |
+| texconv_BC1 | 0.047s | 0.005s |
+
+bc7enc CLI is 6.6× slower than compressonatorcli 8-thread. **This is a
+CLI apples-to-oranges comparison** — compressonatorcli runs 8 threads,
+bc7enc appears single-threaded for non-RDO BC1 paths, and per-process
+startup (≈30ms) dominates on small icons. Library integration of rgbcx
+would not carry the CLI overhead.
+
+**Observations (facts, no editorial):**
+
+1. rgbcx (L18, max quality) beats Compressonator BC1 by +0.8 to +11.8 dB
+   across all 8 comparable files. The two outliers (+7 and +12 dB on
+   `maidfillcant` and `maidindicators`) are extraordinary for BC1 —
+   BC1 gains above 5 dB are rare in the literature.
+
+2. texconv BC1 is consistently the worst of the three on this corpus,
+   -1.8 to -5.1 dB vs Compressonator.
+
+3. Unlike BC7 (frozen since early 2021, no SIMD), Compressonator BC1
+   already has SIMD acceleration added in v4.4 (SSE/AVX2/AVX512 static
+   libs with runtime dispatch). The "stagnant decade-old codec" premise
+   that motivated the BC7 swap does not apply to BC1.
+
+4. The +7–12 dB wins on small icons suggest rgbcx's search strategy
+   handles hard-alpha sprite content particularly well at the block level,
+   likely because it exhaustively searches more endpoint combinations.
+
+**Not answered here:** whether a librgbcx-backed BC1 adapter would be
+faster or slower than Compressonator's SIMD BC1 when both run the same
+thread count. The CLI timing gap (6.6×) is not representative — that's
+startup + single vs. multi-thread, not codec throughput.
+
+**Scoping verdict.** The quality gap is real and consistent. Whether it
+justifies a BC7-scale integration effort depends on whether BC1 output
+quality matters for the target use case (ATAK's stated target is BC7,
+not BC1). The technical preconditions are favorable (rgbcx is already
+a submodule, the CMP_Core adapter pattern is proven). The engineering
+effort would be similar to Phase 2's BC7 adapter. No decision made here.
+
+### Follow-up 1 — Mechanism: why +7/+12 dB on maidfillcant/maidindicators
+
+Block-mode histogram on Compressonator and bc7enc BC1 output for the
+two highest-gap files:
+
+| file | encoder | 4-color | 3-color | total |
+|------|---------|---------|---------|-------|
+| ui_icon_maidfillcant | cmp_BC1_Q1.0 | 0 (0%) | 32 (100%) | 32 |
+| ui_icon_maidfillcant | bc7enc_rgbcx | 22 (69%) | 10 (31%) | 32 |
+| ui_icon_maidindicators | cmp_BC1_Q1.0 | 46 (2%) | 2002 (98%) | 2048 |
+| ui_icon_maidindicators | bc7enc_rgbcx | 1939 (95%) | 109 (5%) | 2048 |
+
+**Explanation.** In BC1, blocks choose either 4-color mode (c0 > c1 as
+packed RGB565) or 3-color mode (c0 ≤ c1), where 3-color mode reserves
+one of the four codepoint indices for transparent black (RGBA = 0).
+Compressonator forces 3-color mode on almost every block because these
+icon textures have alpha=0 background pixels — any block touching the
+background gets punch-through mode, sacrificing one of four color
+interpolation steps to represent the transparent codepoint.
+
+bc7enc uses 4-color mode on most blocks even when some source pixels
+have alpha=0. In 4-color mode there is no transparent codepoint — all
+four interpolated colors serve the visible (alpha>0) pixels. bc7enc
+assigns some index to the alpha=0 pixels but their decoded RGB is
+irrelevant since PSNR masks them out.
+
+The +7–12 dB "extraordinary" BC1 wins are **entirely explained by
+Compressonator's 3-color mode over-use**: it wastes a color slot on
+transparency representation that doesn't matter for rendered output.
+This is not a deep quality advantage of rgbcx's endpoint search — it
+is a BC1 mode-selection policy difference. For rendering, bc7enc's
+approach is also correct (alpha=0 pixels are invisible regardless of
+their encoded RGB).
+
+### Follow-up 2 — BC3 benchmark (the ATAK-relevant pairing)
+
+Same 9-file GAMMA corpus, same methodology. BC3 = separate BC4 alpha
+block + BC1 RGB block per 4×4 tile. The 3-color mode penalty does not
+apply: both encoders can use full 4-color BC1 for RGB regardless of
+alpha, because alpha is handled by the separate BC4 block.
+
+**Variants:**
+- `cmp_BC3_Q1.0` — `build_cli_off`, `-fd BC3 -Quality 1.0 -NumThreads 8`
+- `bc7enc_rgbcx` — `bc7enc -3 -L18` (BC3, rgbcx max quality)
+- `texconv_BC3` — `texconv -f BC3_UNORM -m 1`
+
+**Raw table:**
+
+```
+file                              WxH        variant          t(s)  RGB@a>0   aPSNR
+ui_icon_maidfillcant         32x16     cmp_BC3_Q1.0       0.001    28.69     inf
+                                        bc7enc_rgbcx       0.029    28.69     inf
+                                        texconv_BC3        0.003    25.82     inf
+
+ui_icon_pm_drum             128x64     cmp_BC3_Q1.0       0.001    34.81   47.96
+                                        bc7enc_rgbcx       0.030    36.65   45.36
+                                        texconv_BC3        0.003    35.17   45.94
+
+ui_icon_sks_short           256x64     cmp_BC3_Q1.0       0.002    32.16   48.83
+                                        bc7enc_rgbcx       0.032    33.43   44.90
+                                        texconv_BC3        0.004    32.49   46.77
+
+ui_icon_maidindicators      256x128    cmp_BC3_Q1.0       0.002    33.42     inf
+                                        bc7enc_rgbcx       0.035    35.13   53.58
+                                        texconv_BC3        0.002    33.30     inf
+
+ui_icon_rspartan            512x64     cmp_BC3_Q1.0       0.002    34.65   51.57
+                                        bc7enc_rgbcx       0.035    35.52   47.26
+                                        texconv_BC3        0.002    34.68   50.21
+
+ui_icon_mg36e               512x128    cmp_BC3_Q1.0       0.003    36.49   50.32
+                                        bc7enc_rgbcx       0.039    38.11   47.29
+                                        texconv_BC3        0.004    36.42   48.37
+
+ui_icon_w50                 512x256    cmp_BC3_Q1.0       0.005    32.27   52.29
+                                        bc7enc_rgbcx       0.044    33.59   47.99
+                                        texconv_BC3        0.004    32.77   50.39
+
+ui_maid_pistols            2048x256    cmp_BC3_Q1.0       0.021    34.53   48.77
+                                        bc7enc_rgbcx       0.133    35.65   44.99
+                                        texconv_BC3        0.007    34.62   47.14
+
+dovetail_bump              2048x2048   cmp_BC3_Q1.0       0.223    36.44   49.44
+                                        bc7enc_rgbcx       1.170    36.96   47.80
+                                        texconv_BC3        0.041    34.18   47.99
+
+variant           sum_9_files  mean/file
+cmp_BC3_Q1.0          0.259s      0.029s
+bc7enc_rgbcx          1.547s      0.172s
+texconv_BC3           0.070s      0.008s
+```
+
+**Delta tables — 8 icon files:**
+
+RGB@a>0:
+```
+file                       cmp(dB)  bc7enc Δ  texconv Δ
+ui_icon_maidfillcant        28.69    +0.00      -2.87
+ui_icon_pm_drum             34.81    +1.84      +0.36
+ui_icon_sks_short           32.16    +1.28      +0.33
+ui_icon_maidindicators      33.42    +1.70      -0.13
+ui_icon_rspartan            34.65    +0.88      +0.04
+ui_icon_mg36e               36.49    +1.61      -0.07
+ui_icon_w50                 32.27    +1.32      +0.50
+ui_maid_pistols             34.53    +1.12      +0.09
+```
+
+aPSNR (alpha channel):
+```
+file                       cmp(dB)  bc7enc Δ  texconv Δ
+ui_icon_maidfillcant          inf      0.00       0.00
+ui_icon_pm_drum             47.96     -2.59      -2.02
+ui_icon_sks_short           48.83     -3.93      -2.06
+ui_icon_maidindicators        inf     (bc7enc 53.58, texconv inf)
+ui_icon_rspartan            51.57     -4.31      -1.37
+ui_icon_mg36e               50.32     -3.04      -1.95
+ui_icon_w50                 52.29     -4.30      -1.90
+ui_maid_pistols             48.77     -3.79      -1.63
+```
+
+**Observations:**
+
+1. The dramatic BC1 outliers (+7/+12 dB) disappear in BC3. Once alpha is
+   separated into BC4, both encoders can use full 4-color BC1. bc7enc's
+   RGB advantage drops to **+0.88 to +1.84 dB** — real but modest.
+
+2. Compressonator's alpha (BC4 block) is **consistently better** than
+   bc7enc's: +2.6 to +4.3 dB advantage. Two files (maidfillcant,
+   maidindicators) show perfect (∞ dB) alpha for Compressonator — it
+   achieves lossless BC4 on binary-alpha textures. bc7enc's BC4 encoder
+   has small but nonzero alpha errors even when the source has only two
+   alpha values (0 and 255).
+
+3. texconv is now **competitive on RGB** — within ±0.5 dB of Compressonator
+   on most files (vs. its -1.8 to -5.1 dB loss in BC1). texconv's alpha
+   is in between: worse than Compressonator, better than bc7enc.
+
+4. **Net perceptual tradeoff (bc7enc vs. Compressonator for BC3 icons):**
+   gain ~1.3 dB RGB, lose ~3.4 dB alpha (7-file means, excluding inf).
+   For hard-alpha sprite icons where silhouette sharpness depends on alpha
+   precision, this is not a clear win — alpha quality may matter more than
+   RGB quality for that content type.
+
+### Follow-up 3 — BC3 alpha deep-dive (block precision + threshold crossings)
+
+Two checks to tighten the BC3 alpha verdict.
+
+#### Source code — binary-alpha special case
+
+`CompressAlphaBlock` in `cmp_compressonatorlib/dxtc/codec_dxtc_alpha.cpp:45-50`
+tries both BC4 modes (8-value and 6-value) and picks lower error. Dead
+code at `compressonatorxcodec.cpp:1912-1915` counts values near 0/255
+(`N0s`/`N1s`) but neither counter is used downstream — **no explicit
+binary-alpha branch.** Lossless results on binary-alpha textures emerge
+from the 6-value mode's inherent structure: codepoints 6 and 7 decode
+to exactly 0 and 255 regardless of endpoint values
+(`GetCompressedAlphaRamp`, `compressonatorxcodec.cpp:762-788`). When
+source is all {0, 255}, the 6-value mode achieves zero error and wins
+the mode competition. bc7enc doesn't perform this dual-mode search and
+leaves some binary-alpha blocks with nonzero error.
+
+#### Check 1 — block-level exact alpha (4×4, all 16 pixels zero-error)
+
+Icon corpus (8 files, partial-alpha excluded):
+
+```
+variant          perfect/total   %perfect
+cmp_BC3_Q1.0    47095/50720     92.9%
+bc7enc_rgbcx    45704/50720     90.1%
+texconv_BC3     47101/50720     92.9%
+```
+
+Per-file highlights:
+
+```
+file                       cmp %perf  bc7enc %perf  texconv %perf
+ui_icon_maidfillcant       100.0%       100.0%         100.0%    ← all-binary {0,255}
+ui_icon_maidindicators     100.0%        94.1%         100.0%    ← all-binary {0,255}, bc7enc: 121/2048 imperfect
+ui_icon_rspartan            94.1%        90.9%          94.0%
+ui_icon_mg36e               95.1%        93.8%          95.1%
+ui_icon_w50                 95.9%        94.3%          95.9%
+ui_icon_sks_short           91.7%        87.8%          91.7%
+ui_icon_pm_drum             91.6%        89.8%          91.8%
+ui_maid_pistols             91.3%        88.4%          91.4%
+```
+
+Compressonator and texconv track each other exactly across all files.
+bc7enc is consistently ~2–4 pp lower. **On the two all-binary-alpha
+files (maidfillcant, maidindicators), Compressonator achieves 100%
+perfect blocks (lossless); bc7enc achieves 100% on maidfillcant but
+only 94.1% on maidindicators — 121 blocks with nonzero alpha error
+despite the source containing only {0, 255}.**
+
+dovetail (continuous alpha): cmp=75.0%, bc7enc=47.9%, texconv=75.1%.
+bc7enc's BC4 encoder degrades sharply on non-binary content.
+
+#### Check 2 — alpha-test threshold crossings (opaque = alpha ≥ 128)
+
+Icon corpus (8 files):
+
+```
+variant          crossings / total px    %cross   false-opaque  false-transp
+cmp_BC3_Q1.0    193 / 811,520           0.0238%   78            115
+bc7enc_rgbcx    160 / 811,520           0.0197%   79            81
+texconv_BC3     273 / 811,520           0.0336%   140           133
+```
+
+Sensitivity check at ≥127 threshold (off-by-one): cmp=0.0243%,
+bc7enc=0.0221%, texconv=0.0327%. Ordering unchanged.
+
+**bc7enc causes fewer alpha-test failures than Compressonator on this
+corpus (160 vs 193), despite having lower aPSNR.** The aPSNR deficit
+(-3.4 dB aggregate) comes from errors that push alpha values further
+from the source without crossing 128. Compressonator's errors are
+smaller in absolute magnitude but more often straddle the 128 boundary.
+
+This diverges from the "alpha quality may matter more for hard-cutout
+icons" framing in the previous observation. **For the actual rendering
+use case (alpha test at 128), bc7enc's alpha is marginally better on
+icons**, not worse. The absolute counts are small on both sides (both
+<0.025%), so the practical difference is negligible either way.
+
+dovetail (continuous alpha near 127 mean): cmp=0.282%, bc7enc=2.744%,
+texconv=0.393%. bc7enc's threshold-crossing rate is 10× Compressonator
+on content where alpha values cluster near 128 — a genuine failure mode
+for bc7enc's BC4, but not relevant to hard-cutout sprite icons.
+
+#### Revised summary
+
+| metric | cmp_BC3_Q1.0 | bc7enc_rgbcx Δ | verdict |
+|--------|-------------|----------------|---------|
+| RGB@α>0 PSNR (8 icons, mean) | ~34.4 dB | +1.2 dB | bc7enc wins |
+| aPSNR aggregate (7 non-inf icons) | ~50.0 dB | −3.4 dB | cmp wins |
+| perfect alpha blocks (icons) | 92.9% | −2.8 pp | cmp wins |
+| alpha-test crossings @128 (icons) | 193 px | −33 px (−17%) | bc7enc wins |
+| lossless on binary-alpha (maidindicators) | yes | no (121 bad blocks) | cmp wins |
+
+The aPSNR and perfect-block metrics point one way; the threshold-crossing
+metric (the rendering-relevant one) points the other. The divergence
+happens because bc7enc's alpha errors are distributed differently —
+larger but less likely to straddle 128 on this corpus.
+
+**Net: the tradeoff is more symmetric than the aPSNR delta suggested.**
+bc7enc's alpha is worse in fidelity terms (+3.4 dB aggregate deficit,
+worse lossless rate on binary sources), but marginally better in the
+metric that matters for hard-cutout rendering (-17% fewer alpha-test
+misclassifications on icons). Neither advantage is large enough on its
+own to be decisive.
+
+**Consolidated conclusion across BC1 and BC3:**
+
+The BC1 "extraordinary win" was a mode-selection artifact (3-color
+over-use). The BC3 result — the format actually relevant to ATAK's icon
+path — shows a modest +1 to +2 dB RGB gain for rgbcx. The alpha tradeoff
+is real (bc7enc loses lossless-alpha on some binary sources, degraded
+aPSNR) but does not translate to more alpha-test failures on this corpus.
+Whether the RGB gain justifies a BC7-scale integration effort is a product
+decision. The technical gap is substantially smaller than the BC7 case:
+Compressonator's BC7 was a decade-stale scalar codec; its BC3 already has
+v4.4 SIMD and competitive alpha quality. The BC3 quality gap, unlike BC7's,
+does not represent a correctness or obsolescence problem — it is a
+narrowly-better encoder vs a competent one.
+
+## Phase 8 — Atomics fix for BC7 worker handoff, verified on Windows
+
+Cherry-picked `ee6922dd` "Use atomics for the BC7 worker handoff, not
+volatile" from `jorge-macos-support` onto `bc7enc-rdo-integration`
+(local hash `f1d721c8`; branch already had it applied and was 1 commit
+ahead of `origin/bc7enc-rdo-integration` at session start — no fetch
+needed, `jorge-macos-support` was already present locally). See the
+commit for the race itself: `run`/`exit` were `volatile CMP_BOOL`,
+which orders nothing between threads; on arm64 the producer could
+reuse a worker's slot before the worker's writes to `*out` were
+visible. Author's own measurement on macOS arm64: 10 distinct outputs
+from 10 identical runs pre-fix (stock BC7), 3-6 distinct of 10 for
+batched bc7e, one 19dB PSNR loss, one segfault. Fixed by making both
+fields `std::atomic<bool>` with release-on-store / acquire-on-load
+pairing. Commit claims x86-64's store ordering already hid this bug,
+so Linux/Windows builds should show zero output change — verified
+that claim on Windows rather than assumed it, same as the Linux pass.
+
+Rebuilt all three flavors via `tools/win/build_cli_batch.ps1`
+(`-Flavor off/unbatched/batch`) using VS 2022 BuildTools (MSVC
+14.44.35207) + the bundled CMake/Ninja under
+`Common7\IDE\CommonExtensions\Microsoft\CMake`, driven from WSL via
+`cmd.exe`/`VsDevCmd.bat` interop (no native Windows shell session
+available this pass). All three configure+build clean. `batch`
+produces two pre-existing MSVC warnings in
+`codec_bc7.cpp` (`C4456` variable shadowing on `progress`, `C4701`/
+`C4703` "potentially uninitialized" on `batch_in`) — both benign:
+`batch_in` is always assigned on the `cur_count == 0` branch that
+precedes every use, MSVC's flow analysis just doesn't prove it.
+Present on this same source at the pre-atomics commit too, not
+introduced by this cherry-pick.
+
+Windows exes can't take WSL/POSIX paths (confirmed directly: passing
+`/mnt/c/...` to `compressonatorcli.exe` fails with "No files to
+process in source dir"; `C:\...` works). Wrote three one-line bash
+wrapper shims (`_verify_scratch/wrap_{off,unbatched,batch}.sh`) that
+translate any `/`-leading argv entry through `wslpath -w` before
+`exec`-ing the real `.exe`, and pointed the existing
+`tools/win/verify_*.py --cli/--unbatch/--batch` args at the wrappers
+instead of the exes directly. No changes to the verify scripts
+themselves.
+
+Results, against the same Windows reference MD5s as Phase 4 part 3 /
+Phase 7:
+
+- `verify_boundaries.py` — 9/9 exact, byte-identical to reference:
+  `5fae5456ae19`, `cff9a2cf1964`, `10cda379ba6f`, `16c8a5170408`,
+  `7f115eab183c`; boundaries Q=0.25/0.45/0.65/0.85 resolve to
+  fast/basic/slow/slowest. **PASS.**
+- `verify_bit_identity.py` — 6/6 configs, 100.0000% block match
+  (14976 or 30000 blocks), MD5s byte-identical to reference:
+  `741246ded2fb` (×2), `2df4cbbbe848`, `7b61c709f275`, `ee63f48cc53e`,
+  `1acc20029808`. **PASS.**
+- `verify_no_crash.py` — both flavors exit 0, no crash. **PASS**
+  (this is the script's actual and only contract — see below).
+
+One thing that did NOT reproduce the archived value: the zero-valid-
+modes guard-path payload (`-AlphaRestrict 1`, default ModeMask 0xCF,
+on `ruby_alpha.tga`) hashes to `88ee2a9fac26` on both `unbatch` and
+`batch` this session, not the `7f359e51bc5c` recorded from Phase 4
+part 3 onward through Phase 7. Investigated rather than waved off,
+because a silent hash drift is exactly the kind of thing that should
+be explained, not assumed benign:
+
+1. **Isolated the atomics commit as the variable.** Checked out the
+   direct parent of `f1d721c8` (`52b72868`, docs-only commits since
+   the Phase 7 script-move point — confirmed via
+   `git diff --stat 6a078c4b 52b72868` returning empty for
+   everything except `*.md`/`README*`), rebuilt `unbatched`+`batch`
+   into separate build dirs, reran `verify_no_crash.py` against
+   *that* pair. Result: `88ee2a9fac26` on both — identical to the
+   post-atomics run, not to the archived `7f359e51bc5c`. **The
+   atomics commit is not the cause of the drift**; pre- and
+   post-atomics binaries built in this session agree with each
+   other and disagree with the old archive equally. This is the
+   actual answer to "did the atomics change any MD5 on Windows":
+   no — proven by same-environment A/B, not inferred from the Linux
+   result.
+2. **Traced why this one test's hash isn't a real contract.** Read
+   the guard implementation in
+   `cmp_core/source/bc7enc_rdo_adapter.cpp` (`has_any_alpha_mode`,
+   `choose_params`, `build_params_pair`, lines ~93-197). The routing
+   decision is a pure function of block pixel content and the
+   quality/mask/restrict flags — nothing thread- or environment-
+   dependent — so per-block mode selection is deterministic given
+   identical source, which this is. `verify_no_crash.py`'s own
+   docstring already disclaims a bit-identity contract here ("Success
+   = both binaries exit 0. No bit-identity check here — this is
+   purely a 'does not crash' gate"); the `7f359e51bc5c` cross-checks
+   littered through Phases 4-7 were a bonus assurance on top of that,
+   not the script's actual pass condition, and evidently didn't
+   survive across whatever changed in this machine's toolchain state
+   since. Most likely explanation, not confirmed further: bc7e.ispc
+   compiles four ISA targets (sse2/sse4/avx/avx2, `cmp_core/
+   CMakeLists.txt:134-137`) with runtime CPUID dispatch, and getting
+   the *unrestricted default* preset's search to hit a genuine near-
+   tie in its cost metric is exactly the kind of thing that can flip
+   with a compiler/ISPC minor-version difference without indicating
+   any correctness problem — consistent with every other test (which
+   never hits a fallback/near-tie path) matching exactly.
+
+Net: atomics fix verified to change nothing on Windows/x86 — same
+expectation as Linux, same result, proved by direct A/B rebuild in
+this environment rather than assumed from the other platform. The
+guard-path hash drift is real but pre-existing (present at the
+pre-atomics commit too) and orthogonal to this cherry-pick; flagging
+it here so a future pass doesn't rediscover it from scratch, but not
+treating it as a regression since the script never promised bit-
+identity on that path.

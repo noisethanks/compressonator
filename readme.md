@@ -262,6 +262,8 @@ Apache-2.0 component**, which is satisfied here:
 > [richgel999/bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo),
 > © Richard Geldreich, licensed under the Apache License, Version 2.0.
 
+macOS support (x86_64 and arm64), along with a data race in the BC7 worker-pool handoff affecting all platforms, contributed by [JorgeVV](https://github.com/noisethanks/compressonator/pull/1)
+
 ETCPack and its Ericsson SLA are **not** part of this build's license
 surface — see §3.
 
