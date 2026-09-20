@@ -1,0 +1,180 @@
+# macOS CI — build compressonatorcli (bc7enc_rdo integration) and run
+# the verification suite against the CI-built binaries.
+#
+# Jobs:
+#   build-slice  — matrix [arm64, x86_64]: build the batch slice on
+#                  macos-latest (Apple Silicon). The arm64 job also
+#                  builds the unbatched slice needed by verify_bit_identity
+#                  and verify_no_crash.
+#   universal    — lipo the two batch slices into a fat binary, ad-hoc
+#                  sign it, then run all three verify scripts against the
+#                  arm64 binaries.
+#
+# ISPC arm64-host safety:
+#   GitHub macos-latest runners are Apple Silicon (arm64). We use the
+#   arm64 ISPC v1.31.0 package, which carries both LLVM backends and
+#   can cross-compile the x86_64 slice (measured, v1.31.0 official pkg).
+#   The arm64 ISPC host miscompiles bare `x--` on varying unsigned int
+#   (ispc#3882), corrupting bc7e.ispc's bit-packing (bc7enc_rdo#23).
+#   Chosen mitigation: apply bc7enc_rdo#29, which rewrites the five
+#   affected `x--` sites as `x -= 1`. The alternative (x86_64 ISPC
+#   package under Rosetta 2) is also accepted by build_flavor.sh, but
+#   the arm64 package + patch is preferred — no Rosetta dependency, and
+#   the official arm64 package already carries the x86_64 LLVM backend.
+#   build_flavor.sh verifies at runtime that the chosen mitigation is
+#   actually present and hard-fails if the unsafe combination is detected.
+
+name: macOS CI
+
+on:
+  push:
+    branches:
+      - bc7enc-rdo-integration
+      - master
+  pull_request:
+
+env:
+  ISPC_VERSION: "1.31.0"
+
+jobs:
+  build-slice:
+    name: build ${{ matrix.arch }}
+    runs-on: macos-latest  # Apple Silicon (arm64)
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ../bc7enc_rdo
+
+      - name: Apply bc7enc_rdo#29 (arm64 ispc host miscompile fix)
+        # Rewrites five bare `x--` statements in bc7e.ispc to `x -= 1` so
+        # the arm64 ispc host compiles them correctly (ispc#3882 / bc7enc_rdo#23).
+        # build_flavor.sh's runtime preflight enforces this before any build starts.
+        run: |
+          cd ../bc7enc_rdo
+          curl -fsSL https://github.com/richgel999/bc7enc_rdo/pull/29.diff | git apply
+
+      - name: Fetch external dependencies
+        run: |
+          # The script's last step downloads an OpenEXR tarball from a dead
+          # host and ends in a traceback. OPTION_BUILD_EXR=OFF, so that
+          # failure is harmless — the git clones above it are what matter.
+          python3 build/fetch_dependencies.py || true
+          test -d ../common/lib/ext/glm      || { echo "ERROR: glm missing after fetch"; exit 1; }
+          test -d ../common/lib/ext/rapidxml || { echo "ERROR: rapidxml missing after fetch"; exit 1; }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (arm64 package)
+        run: |
+          curl -fsSL -o /tmp/ispc.tar.gz \
+            "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-macOS.arm64.tar.gz"
+          tar xzf /tmp/ispc.tar.gz -C /tmp
+          # build_flavor.sh expects: $ROOT/tools/ispc/macos/bin/ispc
+          # $ROOT is the parent of the compressonator checkout.
+          mkdir -p ../tools/ispc
+          mv /tmp/ispc-v${{ env.ISPC_VERSION }}-macOS.arm64 ../tools/ispc/macos
+          ../tools/ispc/macos/bin/ispc --version
+
+      - name: Build ${{ matrix.arch }} batch slice
+        run: tools/macos/build_flavor.sh batch ${{ matrix.arch }}
+
+      # arm64 only: build unbatched binary for verify_bit_identity + verify_no_crash
+      - name: Build arm64 unbatched slice
+        if: matrix.arch == 'arm64'
+        run: tools/macos/build_flavor.sh unbatched arm64
+
+      - name: Upload batch slice
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-batch-${{ matrix.arch }}
+          path: build_cli_batch_macos_${{ matrix.arch }}/bin/compressonatorcli-bin
+
+      - name: Upload arm64 unbatched slice
+        if: matrix.arch == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-unbatched-arm64
+          path: build_cli_macos_arm64/bin/compressonatorcli-bin
+
+  universal:
+    name: universal + verify
+    needs: build-slice
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download arm64 batch slice
+        uses: actions/download-artifact@v4
+        with:
+          name: slice-batch-arm64
+          path: slices/arm64
+
+      - name: Download x86_64 batch slice
+        uses: actions/download-artifact@v4
+        with:
+          name: slice-batch-x86_64
+          path: slices/x86_64
+
+      - name: Download arm64 unbatched slice
+        uses: actions/download-artifact@v4
+        with:
+          name: slice-unbatched-arm64
+          path: slices/unbatched
+
+      - name: Restore execute bits (upload-artifact strips permissions)
+        run: |
+          chmod +x slices/arm64/compressonatorcli-bin
+          chmod +x slices/x86_64/compressonatorcli-bin
+          chmod +x slices/unbatched/compressonatorcli-bin
+
+      - name: lipo -create universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            slices/arm64/compressonatorcli-bin \
+            slices/x86_64/compressonatorcli-bin \
+            -output universal/compressonatorcli-bin
+          codesign --force --sign - --identifier compressonatorcli \
+            universal/compressonatorcli-bin
+          codesign --verify --strict --all-architectures \
+            universal/compressonatorcli-bin
+          echo "=== lipo -archs ==="
+          lipo -archs universal/compressonatorcli-bin
+          echo "=== shasum ==="
+          shasum -a 256 universal/compressonatorcli-bin
+
+      - name: verify_boundaries.py
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli slices/arm64/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    slices/unbatched/compressonatorcli-bin \
+            --batch      slices/arm64/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    slices/unbatched/compressonatorcli-bin \
+            --batch      slices/arm64/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: compressonatorcli-macos-universal
+          path: universal/compressonatorcli-bin
