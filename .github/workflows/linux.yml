@@ -1,0 +1,84 @@
+# Linux CI — build compressonatorcli (bc7enc_rdo integration) and run
+# the verification suite against the CI-built binaries.
+#
+# Mirrors the macOS workflow structure. Builds batch and unbatched
+# flavors; runs all three verify scripts. The off flavor is skipped
+# (verify_boundaries and verify_bit_identity both exercise bc7e paths;
+# the off binary is only useful for cross-tool PSNR comparisons, which
+# are manual Phase 3 work).
+#
+# Static linking: build_flavor.sh passes -DCMAKE_EXE_LINKER_FLAGS=-static.
+# ubuntu-latest includes libc.a (via libc6-dev in build-essential) and
+# libstdc++.a (via g++) so no extra apt-get step is needed.
+
+name: Linux CI
+
+on:
+  push:
+    branches:
+      - bc7enc-rdo-integration
+      - master
+  pull_request:
+
+env:
+  ISPC_VERSION: "1.31.0"
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ../bc7enc_rdo
+
+      - name: Fetch external dependencies
+        run: |
+          # Last step downloads an OpenEXR tarball from a dead host and
+          # ends in a traceback. OPTION_BUILD_EXR=OFF, so it is harmless;
+          # the git clones above it are what matter.
+          python3 build/fetch_dependencies.py || true
+          test -d ../common/lib/ext/glm      || { echo "ERROR: glm missing after fetch"; exit 1; }
+          test -d ../common/lib/ext/rapidxml || { echo "ERROR: rapidxml missing after fetch"; exit 1; }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (Linux x86_64)
+        run: |
+          curl -fsSL -o /tmp/ispc.tar.gz \
+            "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-linux.tar.gz"
+          tar xzf /tmp/ispc.tar.gz -C /tmp
+          # build_flavor.sh expects: $ROOT/tools/ispc/linux/bin/ispc
+          # $ROOT is the parent of the compressonator checkout.
+          mkdir -p ../tools/ispc
+          mv /tmp/ispc-v${{ env.ISPC_VERSION }}-linux ../tools/ispc/linux
+          ../tools/ispc/linux/bin/ispc --version
+
+      - name: Build batch
+        run: tools/linux/build_flavor.sh batch
+
+      - name: Build unbatched
+        run: tools/linux/build_flavor.sh unbatched
+
+      - name: verify_boundaries.py
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli build_cli_batch/bin/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    build_cli/bin/compressonatorcli-bin \
+            --batch      build_cli_batch/bin/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    build_cli/bin/compressonatorcli-bin \
+            --batch      build_cli_batch/bin/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
