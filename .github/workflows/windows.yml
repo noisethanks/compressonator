@@ -11,8 +11,12 @@
 # DirectXTex MSB8020 (v142 toolset) is unreachable: external/CMakeLists.txt
 # lines 43 and 57 wrap the DirectXTex include inside if (OPTION_CMP_DIRECTX).
 # With OPTION_CMP_DIRECTX=OFF the vcxproj is never pulled in. The build
-# succeeding on VS 17 2022 without an MSB8020 error is the empirical
-# confirmation.
+# succeeding without an MSB8020 error is the empirical confirmation.
+#
+# VS version: windows-latest now carries VS 18 (2026). We detect the major
+# version at runtime, derive the cmake generator string (e.g.
+# "Visual Studio 18 2026"), and pass it to the build script via -Generator.
+# Add a new entry to $yearMap below when a future VS major appears.
 #
 # DLL dependencies: Phase 5 Windows reference — exactly KERNEL32.dll,
 # ole32.dll, imagehlp.dll. Verified with dumpbin /dependents after build.
@@ -39,15 +43,20 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Confirm VS 2022 toolset
+      - name: Detect VS toolset and set cmake generator
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vs = (& $vswhere -latest -format json | ConvertFrom-Json)[0]
           Write-Host "VS: $($vs.displayName) at $($vs.installationPath)"
-          if ($vs.installationVersion -notlike "17.*") {
-            throw "Expected VS 17 (2022), got: $($vs.installationVersion)"
-          }
+          $major = [int]($vs.installationVersion.Split('.')[0])
+          if ($major -lt 17) { throw "VS 17 (2022) or later required, got: $($vs.installationVersion)" }
+          $yearMap = @{ 17 = "2022"; 18 = "2026" }
+          $year = $yearMap[$major]
+          if (-not $year) { throw "Unrecognized VS major version $major — add entry to yearMap" }
+          $generator = "Visual Studio $major $year"
+          Write-Host "CMake generator: $generator"
+          "VS_GENERATOR=$generator" >> $env:GITHUB_ENV
 
       - name: Clone bc7enc_rdo
         run: git clone https://github.com/richgel999/bc7enc_rdo.git ..\bc7enc_rdo
@@ -74,11 +83,11 @@ jobs:
 
       - name: Build batch
         shell: pwsh
-        run: .\tools\win\build_cli_batch.ps1 -Flavor batch
+        run: .\tools\win\build_cli_batch.ps1 -Flavor batch -Generator $env:VS_GENERATOR
 
       - name: Build unbatched
         shell: pwsh
-        run: .\tools\win\build_cli_batch.ps1 -Flavor unbatched
+        run: .\tools\win\build_cli_batch.ps1 -Flavor unbatched -Generator $env:VS_GENERATOR
 
       - name: Confirm DLL dependencies (KERNEL32 + ole32 + imagehlp only)
         shell: pwsh
