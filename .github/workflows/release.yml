@@ -1,0 +1,445 @@
+# Release workflow — triggered only on vX.Y.Z tag push.
+#
+# Four jobs:
+#   build-linux          — ubuntu-latest, batch+unbatched, full verify, uploads Linux binary
+#   build-macos-slice    — macos-latest matrix [arm64, x86_64], batch+unbatched slices
+#   build-macos-universal — lipo + full verify (both arches), uploads universal binary
+#   build-windows        — windows-latest, batch+unbatched, full verify, uploads Windows binary
+#   release              — needs all three; renames, checksums, creates DRAFT GitHub Release
+#
+# unbatched is built on every OS for verify_bit_identity + verify_no_crash
+# but is not included in release artifacts.
+#
+# The full verify suite (verify_boundaries, verify_bit_identity, verify_no_crash)
+# runs on the exact tagged commit — not inherited from a prior CI run.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  ISPC_VERSION: "1.31.0"
+
+jobs:
+  # ── Linux ──────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends libgl-dev
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ../bc7enc_rdo
+
+      - name: Fetch external dependencies
+        run: |
+          python3 build/fetch_dependencies.py || true
+          test -d ../common/lib/ext/glm      || { echo "ERROR: glm missing"; exit 1; }
+          test -d ../common/lib/ext/rapidxml || { echo "ERROR: rapidxml missing"; exit 1; }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (Linux x86_64)
+        run: |
+          curl -fsSL -o /tmp/ispc.tar.gz \
+            "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-linux.tar.gz"
+          tar xzf /tmp/ispc.tar.gz -C /tmp
+          mkdir -p ../tools/ispc
+          mv /tmp/ispc-v${{ env.ISPC_VERSION }}-linux ../tools/ispc/linux
+          ../tools/ispc/linux/bin/ispc --version
+
+      - name: Build batch
+        run: tools/linux/build_flavor.sh batch
+
+      - name: Build unbatched (needed for verify_bit_identity + verify_no_crash)
+        run: tools/linux/build_flavor.sh unbatched
+
+      - name: Confirm fully static (no dynamic dependencies)
+        run: |
+          for bin in \
+            build_cli_batch/bin/compressonatorcli-bin \
+            build_cli/bin/compressonatorcli-bin; do
+            echo "=== $bin ==="
+            needed=$(readelf -d "$bin" | grep NEEDED || true)
+            if [ -n "$needed" ]; then
+              echo "FAIL: unexpected dynamic dependencies:"
+              echo "$needed"
+              exit 1
+            fi
+            echo "  readelf -d: no NEEDED entries (fully static)"
+          done
+
+      - name: verify_boundaries.py
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli build_cli_batch/bin/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    build_cli/bin/compressonatorcli-bin \
+            --batch      build_cli_batch/bin/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    build_cli/bin/compressonatorcli-bin \
+            --batch      build_cli_batch/bin/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: Upload Linux release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: build_cli_batch/bin/compressonatorcli-bin
+
+  # ── macOS (build slices) ───────────────────────────────────────────────
+  build-macos-slice:
+    name: build macOS ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ../bc7enc_rdo
+
+      - name: Apply bc7enc_rdo#29 (arm64 ispc host miscompile fix)
+        run: |
+          cd ../bc7enc_rdo
+          curl -fsSL https://github.com/richgel999/bc7enc_rdo/pull/29.diff | git apply
+
+      - name: Fetch external dependencies
+        run: |
+          python3 build/fetch_dependencies.py || true
+          test -d ../common/lib/ext/glm      || { echo "ERROR: glm missing"; exit 1; }
+          test -d ../common/lib/ext/rapidxml || { echo "ERROR: rapidxml missing"; exit 1; }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (arm64 package)
+        run: |
+          curl -fsSL -o /tmp/ispc.tar.gz \
+            "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-macOS.arm64.tar.gz"
+          tar xzf /tmp/ispc.tar.gz -C /tmp
+          mkdir -p ../tools/ispc
+          mv /tmp/ispc-v${{ env.ISPC_VERSION }}-macOS.arm64 ../tools/ispc/macos
+          ../tools/ispc/macos/bin/ispc --version
+
+      - name: Build ${{ matrix.arch }} batch slice
+        run: tools/macos/build_flavor.sh batch ${{ matrix.arch }}
+
+      - name: Build ${{ matrix.arch }} unbatched slice (needed for verify)
+        run: tools/macos/build_flavor.sh unbatched ${{ matrix.arch }}
+
+      - name: Upload ${{ matrix.arch }} batch slice
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-slice-batch-${{ matrix.arch }}
+          path: build_cli_batch_macos_${{ matrix.arch }}/bin/compressonatorcli-bin
+
+      - name: Upload ${{ matrix.arch }} unbatched slice
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-slice-unbatched-${{ matrix.arch }}
+          path: build_cli_macos_${{ matrix.arch }}/bin/compressonatorcli-bin
+
+  # ── macOS (universal + verify) ─────────────────────────────────────────
+  build-macos-universal:
+    name: macOS universal + verify
+    needs: build-macos-slice
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download arm64 batch slice
+        uses: actions/download-artifact@v4
+        with:
+          name: release-slice-batch-arm64
+          path: slices/arm64
+
+      - name: Download x86_64 batch slice
+        uses: actions/download-artifact@v4
+        with:
+          name: release-slice-batch-x86_64
+          path: slices/x86_64
+
+      - name: Download arm64 unbatched slice
+        uses: actions/download-artifact@v4
+        with:
+          name: release-slice-unbatched-arm64
+          path: slices/unbatched
+
+      - name: Download x86_64 unbatched slice
+        uses: actions/download-artifact@v4
+        with:
+          name: release-slice-unbatched-x86_64
+          path: slices/unbatched-x86_64
+
+      - name: Restore execute bits (upload-artifact strips permissions)
+        run: |
+          chmod +x slices/arm64/compressonatorcli-bin
+          chmod +x slices/x86_64/compressonatorcli-bin
+          chmod +x slices/unbatched/compressonatorcli-bin
+          chmod +x slices/unbatched-x86_64/compressonatorcli-bin
+
+      - name: lipo -create universal binary
+        run: |
+          mkdir -p universal
+          lipo -create \
+            slices/arm64/compressonatorcli-bin \
+            slices/x86_64/compressonatorcli-bin \
+            -output universal/compressonatorcli-bin
+          codesign --force --sign - --identifier compressonatorcli \
+            universal/compressonatorcli-bin
+          codesign --verify --strict --all-architectures \
+            universal/compressonatorcli-bin
+          echo "=== lipo -archs ==="
+          lipo -archs universal/compressonatorcli-bin
+          echo "=== shasum ==="
+          shasum -a 256 universal/compressonatorcli-bin
+
+      - name: Ensure Rosetta 2 (needed to run x86_64 slice on arm64 runner)
+        run: |
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            softwareupdate --install-rosetta --agree-to-license
+          else
+            echo "Rosetta 2 already available"
+          fi
+
+      - name: verify_boundaries.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli slices/x86_64/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    slices/unbatched-x86_64/compressonatorcli-bin \
+            --batch      slices/x86_64/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    slices/unbatched-x86_64/compressonatorcli-bin \
+            --batch      slices/x86_64/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_boundaries.py (arm64 native)
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli slices/arm64/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py (arm64 native)
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    slices/unbatched/compressonatorcli-bin \
+            --batch      slices/arm64/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py (arm64 native)
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    slices/unbatched/compressonatorcli-bin \
+            --batch      slices/arm64/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: Upload macOS release artifact (universal binary)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: universal/compressonatorcli-bin
+
+  # ── Windows ────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect VS toolset and set cmake generator
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = (& $vswhere -latest -format json | ConvertFrom-Json)[0]
+          Write-Host "VS: $($vs.displayName) at $($vs.installationPath)"
+          $major = [int]($vs.installationVersion.Split('.')[0])
+          if ($major -lt 17) { throw "VS 17 (2022) or later required, got: $($vs.installationVersion)" }
+          $yearMap = @{ 17 = "2022"; 18 = "2026" }
+          $year = $yearMap[$major]
+          if (-not $year) { throw "Unrecognized VS major version $major — add entry to yearMap" }
+          $generator = "Visual Studio $major $year"
+          Write-Host "CMake generator: $generator"
+          "VS_GENERATOR=$generator" >> $env:GITHUB_ENV
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ..\bc7enc_rdo
+
+      - name: Clone external dependencies (glm + rapidxml)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "..\common\lib\ext" | Out-Null
+          git clone --depth=1 --branch 0.9.8.0 https://github.com/g-truc/glm.git ..\common\lib\ext\glm
+          git clone --depth=1 https://github.com/discord/rapidxml.git ..\common\lib\ext\rapidxml
+          if (-not (Test-Path "..\common\lib\ext\glm"))      { throw "glm missing after clone" }
+          if (-not (Test-Path "..\common\lib\ext\rapidxml")) { throw "rapidxml missing after clone" }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (Windows x86_64)
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ispc.zip"
+          Invoke-WebRequest -Uri "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-windows.zip" -OutFile $zip
+          New-Item -ItemType Directory -Force "..\tools\ispc\windows" | Out-Null
+          Expand-Archive -Path $zip -DestinationPath "..\tools\ispc\windows"
+          ..\tools\ispc\windows\ispc-v${{ env.ISPC_VERSION }}-windows\bin\ispc.exe --version
+
+      - name: Build batch
+        shell: pwsh
+        run: .\tools\win\build_cli_batch.ps1 -Flavor batch -Generator $env:VS_GENERATOR
+
+      - name: Build unbatched (needed for verify_bit_identity + verify_no_crash)
+        shell: pwsh
+        run: .\tools\win\build_cli_batch.ps1 -Flavor unbatched -Generator $env:VS_GENERATOR
+
+      - name: Confirm DLL dependencies (KERNEL32 + ole32 + imagehlp only)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = (& $vswhere -latest -property installationPath)
+          $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+                     Where-Object { $_.FullName -like "*Hostx64\x64*" } |
+                     Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsPath" }
+          Write-Host "dumpbin: $dumpbin"
+
+          $expected = [System.Collections.Generic.HashSet[string]]@("KERNEL32.dll","ole32.dll","imagehlp.dll")
+          $ok = $true
+
+          foreach ($bin in @(
+            "build_cli_batch\bin\Release\compressonatorcli.exe",
+            "build_cli\bin\Release\compressonatorcli.exe"
+          )) {
+            Write-Host "=== $bin ==="
+            $out = & $dumpbin /dependents $bin 2>&1
+            $deps = $out | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } |
+                    ForEach-Object { $_.Trim() }
+            Write-Host "  dependencies: $($deps -join ', ')"
+            $unexpected = $deps | Where-Object { -not $expected.Contains($_) }
+            if ($unexpected) {
+              Write-Host "FAIL: unexpected DLLs: $($unexpected -join ', ')"
+              $ok = $false
+            } else {
+              Write-Host "  OK: exactly { $($deps -join ', ') }"
+            }
+          }
+          if (-not $ok) { exit 1 }
+
+      - name: verify_boundaries.py
+        run: |
+          python tools/verify/verify_boundaries.py `
+            --cli build_cli_batch\bin\Release\compressonatorcli.exe `
+            --src runtime\images\ruby.png
+
+      - name: verify_bit_identity.py
+        run: |
+          python tools/verify/verify_bit_identity.py `
+            --unbatch    build_cli\bin\Release\compressonatorcli.exe `
+            --batch      build_cli_batch\bin\Release\compressonatorcli.exe `
+            --ruby       runtime\images\ruby.png `
+            --ruby-alpha runtime\images\ruby_alpha.tga
+
+      - name: verify_no_crash.py
+        run: |
+          python tools/verify/verify_no_crash.py `
+            --unbatch    build_cli\bin\Release\compressonatorcli.exe `
+            --batch      build_cli_batch\bin\Release\compressonatorcli.exe `
+            --ruby-alpha runtime\images\ruby_alpha.tga
+
+      - name: Upload Windows release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: build_cli_batch\bin\Release\compressonatorcli.exe
+
+  # ── GitHub Release ─────────────────────────────────────────────────────
+  release:
+    name: publish draft release
+    needs: [build-linux, build-macos-universal, build-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: dist/linux
+
+      - name: Download macOS universal binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos
+          path: dist/macos
+
+      - name: Download Windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: dist/windows
+
+      - name: Rename and prepare artifacts
+        run: |
+          cp dist/linux/compressonatorcli-bin   dist/compressonatorcli-bc7e
+          cp dist/macos/compressonatorcli-bin   dist/compressonatorcli-bc7e-macos
+          cp dist/windows/compressonatorcli.exe dist/compressonatorcli-bc7e.exe
+          chmod +x dist/compressonatorcli-bc7e dist/compressonatorcli-bc7e-macos
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd dist
+          sha256sum compressonatorcli-bc7e compressonatorcli-bc7e-macos compressonatorcli-bc7e.exe \
+            > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --title "compressonatorcli-bc7e ${{ github.ref_name }}" \
+            --notes "Commit: ${{ github.sha }}" \
+            dist/compressonatorcli-bc7e \
+            dist/compressonatorcli-bc7e-macos \
+            dist/compressonatorcli-bc7e.exe \
+            dist/SHA256SUMS.txt
