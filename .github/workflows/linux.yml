@@ -70,6 +70,21 @@ jobs:
       - name: Build unbatched
         run: tools/linux/build_flavor.sh unbatched
 
+      - name: Confirm fully static (no dynamic dependencies)
+        run: |
+          for bin in \
+            build_cli_batch/bin/compressonatorcli-bin \
+            build_cli/bin/compressonatorcli-bin; do
+            echo "=== $bin ==="
+            needed=$(readelf -d "$bin" | grep NEEDED || true)
+            if [ -n "$needed" ]; then
+              echo "FAIL: unexpected dynamic dependencies:"
+              echo "$needed"
+              exit 1
+            fi
+            echo "  readelf -d: no NEEDED entries (fully static)"
+          done
+
       - name: verify_boundaries.py
         run: |
           python3 tools/verify/verify_boundaries.py \
