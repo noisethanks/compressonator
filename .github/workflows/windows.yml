@@ -1,0 +1,135 @@
+# Windows CI — build compressonatorcli (bc7enc_rdo integration) and run
+# the verification suite against the CI-built binaries.
+#
+# Mirrors the Linux workflow structure. Builds batch and unbatched
+# flavors; runs all three verify scripts.
+#
+# fetch_dependencies.py on Windows also downloads large blobs (DXC
+# ~500 MB, OCL-SDK) that CI does not need. We clone only glm and
+# rapidxml directly and skip the script entirely.
+#
+# DirectXTex MSB8020 (v142 toolset) is unreachable: external/CMakeLists.txt
+# lines 43 and 57 wrap the DirectXTex include inside if (OPTION_CMP_DIRECTX).
+# With OPTION_CMP_DIRECTX=OFF the vcxproj is never pulled in. The build
+# succeeding on VS 17 2022 without an MSB8020 error is the empirical
+# confirmation.
+#
+# DLL dependencies: Phase 5 Windows reference — exactly KERNEL32.dll,
+# ole32.dll, imagehlp.dll. Verified with dumpbin /dependents after build.
+
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - bc7enc-rdo-integration
+      - master
+  pull_request:
+
+env:
+  ISPC_VERSION: "1.31.0"
+
+jobs:
+  build-and-verify:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Confirm VS 2022 toolset
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = (& $vswhere -latest -format json | ConvertFrom-Json)[0]
+          Write-Host "VS: $($vs.displayName) at $($vs.installationPath)"
+          if ($vs.installationVersion -notlike "17.*") {
+            throw "Expected VS 17 (2022), got: $($vs.installationVersion)"
+          }
+
+      - name: Clone bc7enc_rdo
+        run: git clone https://github.com/richgel999/bc7enc_rdo.git ..\bc7enc_rdo
+
+      - name: Clone external dependencies (glm + rapidxml)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "..\common\lib\ext" | Out-Null
+          git clone --depth=1 --branch 0.9.8.0 https://github.com/g-truc/glm.git ..\common\lib\ext\glm
+          git clone --depth=1 https://github.com/discord/rapidxml.git ..\common\lib\ext\rapidxml
+          if (-not (Test-Path "..\common\lib\ext\glm"))      { throw "glm missing after clone" }
+          if (-not (Test-Path "..\common\lib\ext\rapidxml")) { throw "rapidxml missing after clone" }
+
+      - name: Install ISPC ${{ env.ISPC_VERSION }} (Windows x86_64)
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\ispc.zip"
+          Invoke-WebRequest -Uri "https://github.com/ispc/ispc/releases/download/v${{ env.ISPC_VERSION }}/ispc-v${{ env.ISPC_VERSION }}-windows.zip" -OutFile $zip
+          # build_cli_batch.ps1 expects: $RepoRoot\tools\ispc\windows\ispc-v1.31.0-windows\bin\ispc.exe
+          # $RepoRoot is the parent of the compressonator checkout.
+          New-Item -ItemType Directory -Force "..\tools\ispc\windows" | Out-Null
+          Expand-Archive -Path $zip -DestinationPath "..\tools\ispc\windows"
+          ..\tools\ispc\windows\ispc-v${{ env.ISPC_VERSION }}-windows\bin\ispc.exe --version
+
+      - name: Build batch
+        shell: pwsh
+        run: .\tools\win\build_cli_batch.ps1 -Flavor batch
+
+      - name: Build unbatched
+        shell: pwsh
+        run: .\tools\win\build_cli_batch.ps1 -Flavor unbatched
+
+      - name: Confirm DLL dependencies (KERNEL32 + ole32 + imagehlp only)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = (& $vswhere -latest -property installationPath)
+          $dumpbin = Get-ChildItem -Path "$vsPath\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe |
+                     Where-Object { $_.FullName -like "*Hostx64\x64*" } |
+                     Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw "dumpbin.exe not found under $vsPath" }
+          Write-Host "dumpbin: $dumpbin"
+
+          $expected = [System.Collections.Generic.HashSet[string]]@("KERNEL32.dll","ole32.dll","imagehlp.dll")
+          $ok = $true
+
+          foreach ($bin in @(
+            "build_cli_batch\bin\Release\compressonatorcli.exe",
+            "build_cli\bin\Release\compressonatorcli.exe"
+          )) {
+            Write-Host "=== $bin ==="
+            $out = & $dumpbin /dependents $bin 2>&1
+            $deps = $out | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } |
+                    ForEach-Object { $_.Trim() }
+            Write-Host "  dependencies: $($deps -join ', ')"
+            $unexpected = $deps | Where-Object { -not $expected.Contains($_) }
+            if ($unexpected) {
+              Write-Host "FAIL: unexpected DLLs: $($unexpected -join ', ')"
+              $ok = $false
+            } else {
+              Write-Host "  OK: exactly { $($deps -join ', ') }"
+            }
+          }
+          if (-not $ok) { exit 1 }
+
+      - name: verify_boundaries.py
+        run: |
+          python tools/verify/verify_boundaries.py `
+            --cli build_cli_batch\bin\Release\compressonatorcli.exe `
+            --src runtime\images\ruby.png
+
+      - name: verify_bit_identity.py
+        run: |
+          python tools/verify/verify_bit_identity.py `
+            --unbatch    build_cli\bin\Release\compressonatorcli.exe `
+            --batch      build_cli_batch\bin\Release\compressonatorcli.exe `
+            --ruby       runtime\images\ruby.png `
+            --ruby-alpha runtime\images\ruby_alpha.tga
+
+      - name: verify_no_crash.py
+        run: |
+          python tools/verify/verify_no_crash.py `
+            --unbatch    build_cli\bin\Release\compressonatorcli.exe `
+            --batch      build_cli_batch\bin\Release\compressonatorcli.exe `
+            --ruby-alpha runtime\images\ruby_alpha.tga
