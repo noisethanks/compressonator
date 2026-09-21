@@ -33,6 +33,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          # libgl-dev: external/cmake/CMakeLists.txt calls find_package(OpenGL REQUIRED)
+          # before OPTION_CMP_OPENGL=OFF suppresses it. GL headers must be present even
+          # though we never link against them (fully static, OpenGL path disabled).
+          sudo apt-get install -y --no-install-recommends libgl-dev
+
       - name: Clone bc7enc_rdo
         run: git clone https://github.com/richgel999/bc7enc_rdo.git ../bc7enc_rdo
 
