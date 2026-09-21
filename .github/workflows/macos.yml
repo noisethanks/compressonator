@@ -3,12 +3,13 @@
 #
 # Jobs:
 #   build-slice  — matrix [arm64, x86_64]: build the batch slice on
-#                  macos-latest (Apple Silicon). The arm64 job also
-#                  builds the unbatched slice needed by verify_bit_identity
+#                  macos-latest (Apple Silicon). Each arch also builds
+#                  the unbatched slice needed by verify_bit_identity
 #                  and verify_no_crash.
 #   universal    — lipo the two batch slices into a fat binary, ad-hoc
-#                  sign it, then run all three verify scripts against the
-#                  arm64 binaries.
+#                  sign it, then run all three verify scripts against
+#                  both architectures: x86_64 via Rosetta 2 first, then
+#                  arm64 natively. Both arches verified on every CI run.
 #
 # ISPC arm64-host safety:
 #   GitHub macos-latest runners are Apple Silicon (arm64). We use the
@@ -103,6 +104,18 @@ jobs:
           name: slice-unbatched-arm64
           path: build_cli_macos_arm64/bin/compressonatorcli-bin
 
+      # x86_64 only: build unbatched binary for verify_bit_identity + verify_no_crash
+      - name: Build x86_64 unbatched slice
+        if: matrix.arch == 'x86_64'
+        run: tools/macos/build_flavor.sh unbatched x86_64
+
+      - name: Upload x86_64 unbatched slice
+        if: matrix.arch == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slice-unbatched-x86_64
+          path: build_cli_macos_x86_64/bin/compressonatorcli-bin
+
   universal:
     name: universal + verify
     needs: build-slice
@@ -130,11 +143,18 @@ jobs:
           name: slice-unbatched-arm64
           path: slices/unbatched
 
+      - name: Download x86_64 unbatched slice
+        uses: actions/download-artifact@v4
+        with:
+          name: slice-unbatched-x86_64
+          path: slices/unbatched-x86_64
+
       - name: Restore execute bits (upload-artifact strips permissions)
         run: |
           chmod +x slices/arm64/compressonatorcli-bin
           chmod +x slices/x86_64/compressonatorcli-bin
           chmod +x slices/unbatched/compressonatorcli-bin
+          chmod +x slices/unbatched-x86_64/compressonatorcli-bin
 
       - name: lipo -create universal binary
         run: |
@@ -152,13 +172,42 @@ jobs:
           echo "=== shasum ==="
           shasum -a 256 universal/compressonatorcli-bin
 
-      - name: verify_boundaries.py
+      - name: Ensure Rosetta 2 (needed to run x86_64 slice on arm64 runner)
+        run: |
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            softwareupdate --install-rosetta --agree-to-license
+          else
+            echo "Rosetta 2 already available"
+          fi
+
+      - name: verify_boundaries.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_boundaries.py \
+            --cli slices/x86_64/compressonatorcli-bin \
+            --src runtime/images/ruby.png
+
+      - name: verify_bit_identity.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_bit_identity.py \
+            --unbatch    slices/unbatched-x86_64/compressonatorcli-bin \
+            --batch      slices/x86_64/compressonatorcli-bin \
+            --ruby       runtime/images/ruby.png \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_no_crash.py (x86_64 via Rosetta)
+        run: |
+          python3 tools/verify/verify_no_crash.py \
+            --unbatch    slices/unbatched-x86_64/compressonatorcli-bin \
+            --batch      slices/x86_64/compressonatorcli-bin \
+            --ruby-alpha runtime/images/ruby_alpha.tga
+
+      - name: verify_boundaries.py (arm64 native)
         run: |
           python3 tools/verify/verify_boundaries.py \
             --cli slices/arm64/compressonatorcli-bin \
             --src runtime/images/ruby.png
 
-      - name: verify_bit_identity.py
+      - name: verify_bit_identity.py (arm64 native)
         run: |
           python3 tools/verify/verify_bit_identity.py \
             --unbatch    slices/unbatched/compressonatorcli-bin \
@@ -166,7 +215,7 @@ jobs:
             --ruby       runtime/images/ruby.png \
             --ruby-alpha runtime/images/ruby_alpha.tga
 
-      - name: verify_no_crash.py
+      - name: verify_no_crash.py (arm64 native)
         run: |
           python3 tools/verify/verify_no_crash.py \
             --unbatch    slices/unbatched/compressonatorcli-bin \
