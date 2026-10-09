@@ -4,6 +4,8 @@ A fork of [AMD Compressonator](https://github.com/GPUOpen-Tools/compressonator)
 that replaces the CPU-side BC7 codec with the `bc7e.ispc` encoder from
 [richgel999/bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo).
 
+In addition, we provide OSX builds for both x86 and ARM variants. 
+
 > This README section describes the fork. **Everything below the horizontal
 > rule is AMD's original README, unmodified.** The full investigation —
 > every measurement, dead end, and correction — lives in
